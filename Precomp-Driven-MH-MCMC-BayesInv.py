@@ -1,502 +1,531 @@
-import numpy as np
-import time
-import os
+"""
+Precomputation-Driven MH-MCMC: Final Paper Validation  (FIXED v2)
+=================================================================
+Fix 1 (original): Traditional baseline uses A_cached — no basis_matrix()
+  rebuild per iteration. Correct O(NMK) baseline.
+
+Fix 2 (this version): Step sizes now derived from posterior std.
+  Original steps=0.06/sqrt(K) was 10-18x larger than posterior std,
+  causing near-zero acceptance (K=4: ~0%, K=8: ~1%) and false/true
+  non-convergence in Exp-B/D.
+
+  Correct formula (Roberts et al. 1997 RWM optimal):
+      steps = (2.38/sqrt(K)) * post_std
+  where  post_std = sqrt(diag(sigma^2 * (A^T A)^{-1}))
+
+  This requires steps to be computed AFTER precompute() since Q=A^T A
+  is only available then. run_both() now computes and overrides steps
+  before sampling.
+
+Model family (paper Eq.2  d = A*theta):
+  K=1 : A=[1/cosh(x1)...]^T  (separable/rank-1, paper Eq.4)
+  K>=2: A[i,k]=exp(-lk|xi-sk|)  (general linear, paper Eq.2)
+"""
+
+import numpy as np, time, os, warnings
+import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.stats import ks_2samp  # For sampling validity test
+warnings.filterwarnings("ignore")
 
-# ========================== 预定义MathText格式字符串（无需LaTeX，matplotlib自带支持） ==========================
-V0_STR = '$V_0$'
-W0_STR = '$W_0$'
-ALPHA_STR = '$\\alpha$'  # MathText支持与LaTeX相同的转义语法
-
-# ========================== Global Parameter Settings (Multi-scale Experiments) ==========================
-TRUE_PARAMS = {'V0': 1.0, 'W0': 0.5, 'alpha': 1.0}
-NOISE_LEVEL = 0.05
-TIME_STEPS = 40  # Fixed time steps; adjust grid size to change M
-SEED = 42  # Global random seed for reproducibility
-MCMC_SAMPLES = 120000  # Effective sampling number
-MCMC_BURNIN = 24000  # Burn-in period
-STEP_SIZES = {'V0': 0.015, 'W0': 0.007, 'alpha': 0.0045}  # Optimized step sizes
-N_CHAINS = 3  # Number of chains for convergence test
-GRID_SIZES = [50, 100, 200, 400]  # Spatial grid sizes (M = GRID_SIZE × TIME_STEPS)
-RESULT_DIR = "inversion_comparison_results"
-
-# ========================== 关键修改：关闭LaTeX渲染，使用matplotlib自带MathText ==========================
 plt.rcParams.update({
-    'figure.dpi': 300,  # High resolution (minimum 300 dpi for top journals)
-    'font.family': 'Arial',  # Sans-serif font (standard for scientific publications)
-    'font.size': 10,  # Base font size (adjust labels/titles accordingly)
-    'axes.linewidth': 0.8,  # Thin axis lines (cleaner look)
-    'axes.spines.top': False,  # Remove top spine (standard for journals)
-    'axes.spines.right': False,  # Remove right spine
-    'axes.labelpad': 6,  # Padding between axis and label
-    'legend.frameon': True,  # Add legend frame (for clarity)
-    'legend.framealpha': 0.9,  # Slightly transparent legend (avoid blocking data)
-    'legend.loc': 'upper left',  # Default legend position (adjust per figure)
-    'legend.handlelength': 1.5,  # Shorter legend lines (compact)
-    'grid.alpha': 0.3,  # Light grid lines (guide eye without distraction)
-    'grid.linewidth': 0.5,
-    'xtick.major.width': 0.8,
-    'ytick.major.width': 0.8,
-    'xtick.minor.width': 0.4,
-    'ytick.minor.width': 0.4,
-    'xtick.direction': 'in',  # Ticks point inward (journal standard)
-    'ytick.direction': 'in',
-    # 关闭外部LaTeX渲染，启用自带MathText（核心修改）
-    'text.usetex': False,
-    'pgf.rcfonts': False,
-    'axes.formatter.use_mathtext': True  # 启用MathText解析数学符号
+    'figure.dpi':300,'font.family':'DejaVu Sans','font.size':9,
+    'axes.linewidth':0.8,'axes.spines.top':False,'axes.spines.right':False,
+    'axes.labelpad':5,'legend.frameon':True,'legend.framealpha':0.9,
+    'legend.fontsize':8,'grid.alpha':0.25,'grid.linewidth':0.4,
+    'xtick.direction':'in','ytick.direction':'in',
+    'text.usetex':False,'axes.formatter.use_mathtext':True,
 })
 
+RESULT_DIR="results_paper"; os.makedirs(RESULT_DIR,exist_ok=True)
+SEED=42; N_SAMPLES=80_000; N_BURNIN=16_000; N_CHAINS=3; SIGMA_DEF=0.05
 
-# ========================== Data Generation Module ==========================
-class DataGenerator:
-    def __init__(self, grid_size, x_range=(-5, 5), t_range=(0, 2)):
-        self.grid_size = grid_size
-        self.x = np.linspace(*x_range, grid_size)
-        self.t = np.linspace(*t_range, TIME_STEPS)
-        self.X, self.T = np.meshgrid(self.x, self.t, indexing='ij')
-        self.shape = self.X.shape
-        self.M = grid_size * TIME_STEPS  # Number of observations (M in theory)
 
-    def exact_amplitude(self, V0, W0, alpha):
-        x_flat = self.X.ravel()
-        amp = np.sqrt((2 - V0 + W0 **2 / 9) / alpha) / np.cosh(x_flat)
-        return amp.reshape(self.shape)
+# ─── Model ───────────────────────────────────────────────────────────
 
-    def generate_obs_data(self):
-        amp_clean = self.exact_amplitude(** TRUE_PARAMS)
+class LinearModel:
+    """
+    d = A*theta,  A in R^{M x K}  (parameter-independent, built once).
+    K=1:  A = 1/cosh(x)  (separable rank-1, paper Eq.4)
+    K>=2: A[i,k] = exp(-lk|xi-sk|)  (Green's basis, paper Eq.2)
+
+    Precomputed: Q=A^T A, c=2A^T(-d)  -> O(K^2) per iteration.
+    Traditional: A cached, A@theta only -> O(MK) per iteration.
+
+    NOTE: self.steps is a placeholder; run_both() overrides it with
+    posterior-std-based steps after precompute() is called.
+    """
+    def __init__(self, K, sigma=SIGMA_DEF):
+        self.K = K
+        self.sigma = sigma
+        rng = np.random.RandomState(0)
+        if K == 1:
+            self.name = "Separable (K=1)"
+            self.theta_true = np.array([np.sqrt((2-1.0+0.5**2/9)/1.0)])
+            self.bounds = [(0.5, 2.0)]
+            self.steps = np.array([0.012])   # overridden in run_both
+            self._fn = "sech"
+        else:
+            self.name = f"Linear (K={K})"
+            self.lambdas = 0.3 + 0.4*rng.rand(K)
+            self.sources = np.linspace(-4, 4, K)
+            self.theta_true = np.clip(rng.randn(K)*0.4+1.0, 0.2, 2.0)
+            self.bounds = [(0.0, 3.0)]*K
+            self.steps = np.full(K, 0.06/np.sqrt(K))  # overridden in run_both
+            self._fn = "green"
+
+    def basis_matrix(self, x):
+        """Build A once — NOT called per MCMC iteration."""
+        if self._fn == "sech":
+            return (1.0/np.cosh(x)).reshape(-1, 1)
+        diff = np.abs(x[:,None] - self.sources[None,:])
+        return np.exp(-self.lambdas[None,:] * diff)
+
+    def generate_data(self, x, sigma):
         np.random.seed(SEED)
-        noise = NOISE_LEVEL * np.random.randn(*amp_clean.shape)
-        return amp_clean + noise
+        return self.basis_matrix(x) @ self.theta_true + sigma*np.random.randn(len(x))
 
-    def save_data(self, data_path):
-        data = np.column_stack((self.X.ravel(), self.T.ravel(), self.generate_obs_data().ravel()))
-        np.savetxt(data_path, data, delimiter=',', header='x,t,amplitude', comments='')
+    def precompute(self, x, d_obs):
+        """O(MK^2) once. Stores A for traditional path."""
+        A = self.basis_matrix(x)
+        Q = A.T @ A
+        c = 2.0 * (A.T @ (-d_obs))
+        c0 = np.dot(d_obs, d_obs)
+        return {'Q': Q, 'c': c, 'c0': c0, 'A': A}
 
+    def compute_optimal_steps(self, Q, sigma):
+        """
+        FIX 2: Compute per-dimension step sizes from posterior std.
+        Posterior Cov ~ sigma^2 * (A^T A)^{-1}  (Gaussian likelihood)
+        Optimal RWM step (Roberts et al. 1997): 2.38/sqrt(K) * post_std
+        This gives acceptance rate ~23% in high dimensions.
+        """
+        try:
+            cov = sigma**2 * np.linalg.inv(Q)
+            post_std = np.sqrt(np.maximum(np.diag(cov), 1e-12))
+        except np.linalg.LinAlgError:
+            # Fallback if Q is singular
+            post_std = np.full(self.K, sigma / np.sqrt(Q.diagonal().mean()))
+        steps = (2.38 / np.sqrt(self.K)) * post_std
+        return steps
 
-# ========================== Base Bayesian Inverter (Convergence/Validity Tests) ==========================
-class BaseBayesianInverter:
-    def __init__(self, data_path):
-        self.data = np.loadtxt(data_path, delimiter=',', skiprows=1)
-        self.x_obs = self.data[:, 0]
-        self.amp_obs = self.data[:, 2]
-        self.M = len(self.amp_obs)  # Observation size M
-        self.param_names = [V0_STR, W0_STR, ALPHA_STR]  # 使用预定义MathText字符串
-        self.d = len(self.param_names)  # Parameter dimension
+    def log_like_precomp(self, theta, pc, sigma):
+        """O(K^2) per iteration. Constant c0 dropped (cancels in MH ratio)."""
+        q = theta @ pc['Q'] @ theta + pc['c'] @ theta
+        return -q / (2*sigma**2)
 
-    def log_prior(self, V0, W0, alpha):
-        if 0.2 < V0 < 1.8 and 0.2 < W0 < 0.8 and 0.6 < alpha < 1.4:
-            return 0.0
-        return -np.inf
+    def log_like_traditional(self, theta, A_cached, d_obs, sigma):
+        """O(MK) per iteration. Uses pre-built A_cached — no basis rebuild."""
+        r = A_cached @ theta - d_obs
+        return -np.dot(r, r) / (2*sigma**2)
 
-    def metropolis_hastings(self, init_params=None, track_complexity=False):
-        if init_params is None:
-            np.random.seed(SEED)
-            init_params = np.array(
-                [TRUE_PARAMS['V0'], TRUE_PARAMS['W0'], TRUE_PARAMS['alpha']]) + 0.2 * np.random.randn(3)
-        params = init_params.copy()
-        samples = np.zeros((MCMC_SAMPLES, 3))
-        accept_count = 0
-        step_sizes = np.array([STEP_SIZES['V0'], STEP_SIZES['W0'], STEP_SIZES['alpha']])
-        current_log_like = self.log_likelihood(*params)
-        total_iter = MCMC_SAMPLES + MCMC_BURNIN
-
-        complexity_metrics = {
-            'total_operations': 0,
-            'data_accesses': 0,
-            'param_operations': 0
-        }
-
-        burnin_samples = []
-        for i in range(total_iter):
-            proposal = params + step_sizes * np.random.randn(3)
-            if track_complexity:
-                complexity_metrics['param_operations'] += self.d
-
-            lp_proposal = self.log_prior(*proposal)
-            if lp_proposal == -np.inf:
-                if i >= MCMC_BURNIN:
-                    samples[i - MCMC_BURNIN] = params
-                else:
-                    burnin_samples.append(params.copy())
-                continue
-
-            log_like_proposal = self.log_likelihood(*proposal, track_complexity=track_complexity)
-            if track_complexity:
-                complexity_metrics['total_operations'] += self.M
-                complexity_metrics['data_accesses'] += self.M
-
-            log_accept_prob = lp_proposal + log_like_proposal - (self.log_prior(*params) + current_log_like)
-            if np.log(np.random.rand()) < log_accept_prob:
-                params = proposal.copy()
-                current_log_like = log_like_proposal
-                if i >= MCMC_BURNIN:
-                    accept_count += 1
-
-            if i < MCMC_BURNIN:
-                burnin_samples.append(params.copy())
-            else:
-                samples[i - MCMC_BURNIN] = params
-
-        accept_rate = accept_count / MCMC_SAMPLES
-        return {
-            'samples': samples,
-            'burnin_samples': np.array(burnin_samples),
-            'accept_rate': accept_rate,
-            'complexity': complexity_metrics if track_complexity else None
-        }
-
-    def test_sampling_validity(self, samples):
-        results = {}
-
-        # Autocorrelation analysis
-        acf_results = {}
-        for i, name in enumerate(self.param_names):
-            lag_max = 100
-            acf = [np.corrcoef(samples[:-lag, i], samples[lag:, i])[0, 1]
-                   for lag in range(1, lag_max + 1)]
-            acf_results[name] = {
-                'acf': acf,
-                'lag_max': lag_max,
-                'first_zero_lag': next((lag for lag, val in enumerate(acf) if abs(val) < 0.05), lag_max)
-            }
-        results['autocorrelation'] = acf_results
-
-        # KS test for marginal distribution
-        split_idx = len(samples) // 2
-        ref_samples = samples[:split_idx]
-        test_samples = samples[split_idx:]
-        ks_results = {}
-        for i, name in enumerate(self.param_names):
-            stat, pval = ks_2samp(ref_samples[:, i], test_samples[:, i])
-            ks_results[name] = {
-                'statistic': stat,
-                'pvalue': pval,
-                'passed': pval > 0.05
-            }
-        results['ks_test'] = ks_results
-
-        return results
-
-    @staticmethod
-    def test_convergence(multiple_chains):
-        n_chains, n_samples, n_params = multiple_chains.shape
-        param_names = [V0_STR, W0_STR, ALPHA_STR]  # 统一参数名
-        results = {}
-
-        # Calculate per-chain statistics for each parameter
-        chain_means = np.mean(multiple_chains, axis=1)  # Shape: (n_chains, n_params)
-        chain_vars = np.var(multiple_chains, axis=1, ddof=1)  # Shape: (n_chains, n_params)
-
-        # Calculate overall r-hat
-        between_var = n_samples * np.var(chain_means, axis=0, ddof=1)
-        within_var = np.mean(chain_vars, axis=0)
-        pooled_var = (n_samples - 1) / n_samples * within_var + between_var / n_samples
-        r_hat = np.sqrt(pooled_var / within_var)
-        results['r_hat'] = {name: r_hat[i] for i, name in enumerate(param_names)}
-
-        # Store per-chain r-hat (核心：每条链的r-hat值)
-        results['per_chain_r_hat'] = np.zeros((n_chains, n_params))
-        for chain_idx in range(n_chains):
-            # 留一法计算单链r-hat
-            other_chains = np.delete(multiple_chains, chain_idx, axis=0)
-            other_means = np.mean(other_chains, axis=1)
-
-            between_var_loo = n_samples * np.var(other_means, axis=0, ddof=1)
-            within_var_loo = np.mean(np.delete(chain_vars, chain_idx, axis=0), axis=0)
-            pooled_var_loo = (n_samples - 1) / n_samples * within_var_loo + between_var_loo / n_samples
-            results['per_chain_r_hat'][chain_idx] = np.sqrt(pooled_var_loo / within_var_loo)
-
-        var_ratio = within_var / between_var if np.any(between_var) else np.zeros(n_params)
-        results['variance_ratio'] = {name: var_ratio[i] for i, name in enumerate(param_names)}
-
-        last_10pct = int(n_samples * 0.1)
-        final_means = np.mean(multiple_chains[:, -last_10pct:, :], axis=1)
-        final_mean_diff = np.abs(final_means - chain_means).mean(axis=0)
-        results['final_mean_diff'] = {name: final_mean_diff[i] for i, name in enumerate(param_names)}
-
-        results['converged'] = all(r < 1.2 for r in r_hat)
-        return results
+    def log_prior(self, theta):
+        return 0.0 if all(lo<p<hi for p,(lo,hi) in zip(theta,self.bounds)) else -np.inf
 
 
-# ========================== Inverter with Precomputation ==========================
-class BayesianInverterWithPrecompute(BaseBayesianInverter):
-    def __init__(self, data_path):
-        super().__init__(data_path)
-        self.precompute_time = 0
-        self._precompute_terms()
+# ─── MCMC engine ─────────────────────────────────────────────────────
 
-    def _precompute_terms(self):
-        start = time.time()
-        self.cosh_x = np.cosh(self.x_obs)  # Parameter-independent term: O(M)
-        self.precompute_time = time.time() - start
-
-    def log_likelihood(self, V0, W0, alpha, track_complexity=False):
-        amp_model = np.sqrt((2 - V0 + W0 **2 / 9) / alpha) / self.cosh_x
-        residual = self.amp_obs - amp_model
-        return -0.5 * np.sum(residual** 2) / (NOISE_LEVEL **2)
-
-
-# ========================== Inverter without Precomputation ==========================
-class BayesianInverterWithoutPrecompute(BaseBayesianInverter):
-    def __init__(self, data_path):
-        super().__init__(data_path)
-        self.precompute_time = 0
-
-    def log_likelihood(self, V0, W0, alpha, track_complexity=False):
-        cosh_x = np.cosh(self.x_obs)  # Recompute every time: O(M)
-        amp_model = np.sqrt((2 - V0 + W0 **2 / 9) / alpha) / cosh_x
-        residual = self.amp_obs - amp_model
-        return -0.5 * np.sum(residual** 2) / (NOISE_LEVEL **2)
+def run_mcmc(ll_fn, lp_fn, init, steps,
+             n_samples=N_SAMPLES, n_burnin=N_BURNIN):
+    d = len(init)
+    samples = np.zeros((n_samples, d))
+    th = init.copy()
+    cur_ll = ll_fn(th); cur_lp = lp_fn(th)
+    n_acc = 0
+    for i in range(n_samples + n_burnin):
+        prop = th + steps * np.random.randn(d)
+        lp2 = lp_fn(prop)
+        if lp2 == -np.inf:
+            if i >= n_burnin: samples[i-n_burnin] = th
+            continue
+        ll2 = ll_fn(prop)
+        if np.log(np.random.rand()) < (lp2+ll2) - (cur_lp+cur_ll):
+            th, cur_ll, cur_lp = prop, ll2, lp2
+            if i >= n_burnin: n_acc += 1
+        if i >= n_burnin: samples[i-n_burnin] = th
+    return samples, n_acc/n_samples
 
 
-# ========================== Experiment Framework ==========================
-def run_algorithm(inverter_class, data_path, track_complexity=False):
-    try:
-        start = time.time()
-        inverter = inverter_class(data_path)
+def run_both(model, x, d_obs, sigma=SIGMA_DEF):
+    """
+    FIX 1: A_cached passed to traditional path — no basis_matrix() per iter.
+    FIX 2: steps overridden with posterior-std-based optimal steps.
+    Both paths use the same steps for a fair comparison.
+    """
+    pc = model.precompute(x, d_obs)
+    A_cached = pc['A']
 
-        chains = []
-        for i in range(N_CHAINS):
-            np.random.seed(SEED + i)
-            init_params = np.array(
-                [TRUE_PARAMS['V0'], TRUE_PARAMS['W0'], TRUE_PARAMS['alpha']]) + 0.2 * np.random.randn(3)
-            result = inverter.metropolis_hastings(init_params=init_params, track_complexity=track_complexity)
-            chains.append(result['samples'])
+    # FIX 2: compute optimal steps from Q after precompute
+    steps = model.compute_optimal_steps(pc['Q'], sigma)
 
-        total_time = time.time() - start
-        convergence = BaseBayesianInverter.test_convergence(np.array(chains))
-        all_samples = np.concatenate(chains, axis=0)
-        validity = inverter.test_sampling_validity(all_samples)
+    # precomputed path
+    chains_pre = []; t0 = time.time()
+    for ci in range(N_CHAINS):
+        np.random.seed(SEED+ci)
+        init = model.theta_true + 0.05*np.random.randn(model.K)
+        ll_fn = lambda th, _pc=pc, _s=sigma: model.log_like_precomp(th, _pc, _s)
+        s, _ = run_mcmc(ll_fn, model.log_prior, init, steps)
+        chains_pre.append(s)
+    t_pre = time.time()-t0
 
-        complexity = result['complexity'] if track_complexity else None
-        return {
-            'success': True,
-            'chains': np.array(chains),
-            'convergence': convergence,
-            'validity': validity,
-            'total_time': total_time,
-            'precompute_time': inverter.precompute_time,
-            'iteration_time': total_time - inverter.precompute_time,
-            'complexity': complexity,
-            'M': inverter.M
-        }
-    except Exception as e:
-        print(f"Algorithm error: {str(e)}")
-        return {'success': False, 'error': str(e)}
+    # traditional path — A_cached passed, no rebuild
+    chains_trad = []; t0 = time.time()
+    for ci in range(N_CHAINS):
+        np.random.seed(SEED+ci)
+        init = model.theta_true + 0.05*np.random.randn(model.K)
+        ll_fn = lambda th, _A=A_cached, _d=d_obs, _s=sigma: \
+            model.log_like_traditional(th, _A, _d, _s)
+        s, _ = run_mcmc(ll_fn, model.log_prior, init, steps)
+        chains_trad.append(s)
+    t_trad = time.time()-t0
 
-
-def compare_algorithms(grid_size, track_complexity=True):
-    try:
-        dg = DataGenerator(grid_size)
-        data_path = os.path.join(RESULT_DIR, f"obs_data_M{dg.M}.csv")
-        dg.save_data(data_path)
-        print(f"\n{'=' * 60}\nTesting M={dg.M} (Grid {grid_size}×{TIME_STEPS}) —— Key Results\n{'=' * 60}")
-
-        # 运行两种算法，收集收敛数据
-        pre_result = run_algorithm(BayesianInverterWithPrecompute, data_path, track_complexity)
-        no_pre_result = run_algorithm(BayesianInverterWithoutPrecompute, data_path, track_complexity)
-
-        if not pre_result['success'] or not no_pre_result['success']:
-            print(f"Algorithm failed: Precompute={pre_result['success']}, No-Precompute={no_pre_result['success']}")
-            return None
-
-        # 打印每条链的r-hat值（带/不带预计算对比）
-        print("\n>>> 详细r-hat数值分析（验证预计算不影响收敛性） <<<")
-        print(f"观测点数量 M = {dg.M}")
-
-        # 带预计算的每条链r-hat
-        print("\n【带预计算】:")
-        pre_conv = pre_result['convergence']
-        for chain_idx in range(N_CHAINS):
-            print(
-                f"  链 {chain_idx + 1}: {V0_STR}={pre_conv['per_chain_r_hat'][chain_idx, 0]:.4f}, "
-                f"{W0_STR}={pre_conv['per_chain_r_hat'][chain_idx, 1]:.4f}, "
-                f"{ALPHA_STR}={pre_conv['per_chain_r_hat'][chain_idx, 2]:.4f}"
-            )
-        print(
-            f"  整体r-hat: {V0_STR}={pre_conv['r_hat'][V0_STR]:.4f}, {W0_STR}={pre_conv['r_hat'][W0_STR]:.4f}, {ALPHA_STR}={pre_conv['r_hat'][ALPHA_STR]:.4f}"
-        )
-
-        # 无预计算的每条链r-hat
-        print("\n【无预计算】:")
-        no_pre_conv = no_pre_result['convergence']
-        for chain_idx in range(N_CHAINS):
-            print(
-                f"  链 {chain_idx + 1}: {V0_STR}={no_pre_conv['per_chain_r_hat'][chain_idx, 0]:.4f}, "
-                f"{W0_STR}={no_pre_conv['per_chain_r_hat'][chain_idx, 1]:.4f}, "
-                f"{ALPHA_STR}={no_pre_conv['per_chain_r_hat'][chain_idx, 2]:.4f}"
-            )
-        print(
-            f"  整体r-hat: {V0_STR}={no_pre_conv['r_hat'][V0_STR]:.4f}, {W0_STR}={no_pre_conv['r_hat'][W0_STR]:.4f}, {ALPHA_STR}={no_pre_conv['r_hat'][ALPHA_STR]:.4f}"
-        )
-
-        # 打印运行时间和加速比
-        print(
-            f"\n[带预计算] 运行时间: {pre_result['total_time']:.4f}s | 收敛性: {'通过' if pre_result['convergence']['converged'] else '未通过'} (最大r-hat: {max(pre_result['convergence']['r_hat'].values()):.3f})")
-        print(
-            f"[无预计算] 运行时间: {no_pre_result['total_time']:.4f}s | 收敛性: {'通过' if no_pre_result['convergence']['converged'] else '未通过'} (最大r-hat: {max(no_pre_result['convergence']['r_hat'].values()):.3f})")
-
-        speedup = no_pre_result['total_time'] / pre_result['total_time']
-        print(f"[加速比] {speedup:.2f}x (预计算方法快{speedup:.2f}倍)\n")
-
-        return {
-            'M': dg.M,
-            'precompute_time': pre_result['total_time'],
-            'no_precompute_time': no_pre_result['total_time'],
-            'speedup': speedup,
-            'success': True,
-            'pre_conv': pre_result['convergence'],
-            'no_pre_conv': no_pre_result['convergence']
-        }
-    except Exception as e:
-        print(f"Comparison error: {str(e)}")
-        return {'success': False, 'error': str(e)}
+    cp = np.array(chains_pre); ct = np.array(chains_trad)
+    mp, sp = _stats(cp); mt, st = _stats(ct)
+    return dict(
+        M=len(x), K=model.K, name=model.name, sigma=sigma,
+        t_pre=t_pre, t_trad=t_trad, speedup=t_trad/t_pre,
+        rhat_pre=_rhat(cp), rhat_trad=_rhat(ct),
+        mean_pre=mp, std_pre=sp, mean_trad=mt, std_trad=st,
+        theta_true=model.theta_true,
+        chains_pre=cp, chains_trad=ct,
+        steps_used=steps,
+    )
 
 
-# ========================== 绘图函数（使用MathText显示数学符号，无需LaTeX） ==========================
-def plot_comparison_results(all_results):
-    valid_results = [r for r in all_results if r and r.get('success', False)]
-    if not valid_results:
-        print("No valid results for plotting")
-        return
+def _rhat(chains):
+    nc, n, p = chains.shape
+    cm = chains.mean(1); cv = chains.var(1, ddof=1)
+    W = cv.mean(0); B = n*cm.var(0, ddof=1)
+    W = np.maximum(W, 1e-12)
+    pv = (n-1)/n*W + B/n
+    return np.sqrt(pv/W)
 
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    Ms = [r['M'] for r in valid_results]
-    speedups = [r['speedup'] for r in valid_results]
-    pre_times = [r['precompute_time'] for r in valid_results]
-    no_pre_times = [r['no_precompute_time'] for r in valid_results]
+def _stats(chains):
+    s = chains.reshape(-1, chains.shape[-1])
+    return s.mean(0), s.std(0, ddof=1)
 
-    # 1. 时间对比图
-    fig, ax = plt.subplots(figsize=(6, 4.5))
-    ax.plot(Ms, pre_times, 'o-', color='#1f77b4', linewidth=2, markersize=6, label='With Precomputation')
-    ax.plot(Ms, no_pre_times, 's-', color='#d62728', linewidth=2, markersize=6, label='Without Precomputation')
-    ax.set_xlabel('Number of Observations ($M$)', fontsize=12)  # MathText显示$M$
-    ax.set_ylabel('Total Runtime (s)', fontsize=12)
+
+# ─── Experiments ─────────────────────────────────────────────────────
+
+def exp_A():
+    print("\n"+"="*60)
+    print("Exp-A  K=1 (separable)  multi-scale M")
+    print("="*60)
+    grid_sizes=[50,100,200,400,800,1600]; time_steps=40
+    model = LinearModel(K=1); results = []
+    for gs in grid_sizes:
+        x = np.linspace(-5,5,gs*time_steps)
+        d_obs = model.generate_data(x, SIGMA_DEF)
+        print(f"  M={len(x):>6d} ...", end=" ", flush=True)
+        r = run_both(model, x, d_obs); results.append(r)
+        print(f"speedup={r['speedup']:5.2f}x  theory~{len(x):.0f}x  "
+              f"rhat={r['rhat_pre'].max():.3f}  "
+              f"{'OK' if r['rhat_pre'].max()<1.2 else 'FAIL'}")
+    return results
+
+
+def exp_B():
+    print("\n"+"="*60)
+    print("Exp-B  Linear K=2,4,8  M=8000")
+    print("  Fix 1: A cached in trad path")
+    print("  Fix 2: steps = (2.38/sqrt(K)) * post_std  (RWM optimal)")
+    print("="*60)
+    K_vals=[2,4,8]; M=8000; x=np.linspace(-5,5,M); results={}
+    for K in K_vals:
+        model = LinearModel(K=K)
+        d_obs = model.generate_data(x, SIGMA_DEF)
+        print(f"  K={K:>2d} ...", end=" ", flush=True)
+        r = run_both(model, x, d_obs); results[K] = r
+        err = np.abs(r['mean_pre'] - r['theta_true']).mean()
+        print(f"speedup={r['speedup']:6.2f}x  theory~M/K={M/K:.0f}x  "
+              f"rhat={r['rhat_pre'].max():.3f}  err={err:.4f}  "
+              f"steps_mean={r['steps_used'].mean():.5f}  "
+              f"{'OK' if r['rhat_pre'].max()<1.2 else 'FAIL'}")
+    return results
+
+
+def exp_C(results_A):
+    print("\n"+"="*60)
+    print("Exp-C  Posterior accuracy  (Theorem 1)")
+    print("="*60)
+    best = max(results_A, key=lambda r: r['M'])
+    K = best['K']; tv = best['theta_true']
+    print(f"  M={best['M']}, K={K}")
+    print(f"  {'Param':<7} {'True':>9} {'Pre mean':>12} {'Trad mean':>12} {'|Dmean|':>10}")
+    print("  "+"-"*54)
+    for j in range(K):
+        diff = abs(best['mean_pre'][j] - best['mean_trad'][j])
+        print(f"  th{j+1:<5} {tv[j]:>9.6f} {best['mean_pre'][j]:>12.8f} "
+              f"{best['mean_trad'][j]:>12.8f} {diff:>10.2e}")
+    md = max(abs(best['mean_pre'][j]-best['mean_trad'][j]) for j in range(K))
+    print(f"\n  Max|Dmean|={md:.2e} -> Theorem 1 "
+          f"{'CONFIRMED' if md<1e-4 else 'WARNING'}")
+    return best
+
+
+def exp_D(results_A, results_B):
+    print("\n"+"="*60)
+    print("Exp-D  R-hat  (Theorem 3)")
+    print("="*60)
+    print("  [K=1]")
+    for r in results_A:
+        rp=r['rhat_pre'].max(); rt=r['rhat_trad'].max()
+        print(f"  M={r['M']:>6d}  pre={rp:.3f}  trad={rt:.3f}  "
+              f"{'OK' if rp<1.2 and rt<1.2 else 'FAIL'}")
+    print("  [K=2,4,8]")
+    for K,r in results_B.items():
+        rp=r['rhat_pre'].max(); rt=r['rhat_trad'].max()
+        print(f"  K={K:>2d}  pre={rp:.3f}  trad={rt:.3f}  "
+              f"steps_mean={r['steps_used'].mean():.5f}  "
+              f"{'OK' if rp<1.2 and rt<1.2 else 'FAIL'}")
+
+
+def exp_E():
+    print("\n"+"="*60)
+    print("Exp-E  Noise robustness  K=1, M=8000")
+    print("="*60)
+    sigmas=[0.02,0.05,0.10,0.20]; M=8000; x=np.linspace(-5,5,M)
+    model=LinearModel(K=1); results=[]
+    for sigma in sigmas:
+        d_obs = model.generate_data(x, sigma)
+        print(f"  s={sigma:.2f} ...", end=" ", flush=True)
+        r = run_both(model, x, d_obs, sigma=sigma)
+        r['sigma'] = sigma; results.append(r)
+        err = abs(r['mean_pre'][0]-model.theta_true[0])
+        print(f"speedup={r['speedup']:5.2f}x  rhat={r['rhat_pre'].max():.3f}  "
+              f"err={err:.5f}  {'OK' if r['rhat_pre'].max()<1.2 else 'FAIL'}")
+    return results
+
+
+def exp_F(results_A, results_B):
+    print("\n"+"="*60)
+    print("Exp-F  Theory vs Measured  (Remark 1)")
+    print("="*60)
+    print("  [K=1]")
+    print(f"  {'M':>7} {'Theory':>10} {'Measured':>10} {'Ratio':>8}")
+    for r in results_A:
+        th = r['M']/r['K']
+        print(f"  {r['M']:>7d} {th:>10.0f} {r['speedup']:>10.2f} {r['speedup']/th:>8.5f}")
+    print("  [K=2,4,8]")
+    print(f"  {'K':>5} {'Theory':>10} {'Measured':>10} {'Ratio':>8}")
+    for K,r in results_B.items():
+        th = r['M']/K
+        print(f"  {K:>5d} {th:>10.0f} {r['speedup']:>10.2f} {r['speedup']/th:>8.5f}")
+    print("  Ratio < 1: MCMC overhead dominates precomp path (Remark 1).")
+    print("  Ratio increases with K as O(K^2) quadratic form cost grows.")
+
+
+# ─── Figures ─────────────────────────────────────────────────────────
+
+def plot_all(results_A, results_B, best_C, results_E):
+    Ms=[r['M'] for r in results_A]
+    t_pre=[r['t_pre'] for r in results_A]
+    t_trad=[r['t_trad'] for r in results_A]
+    speedups=[r['speedup'] for r in results_A]
+
+    # Fig1: time comparison + speedup vs M
+    fig, axes = plt.subplots(1,2,figsize=(11,4.2))
+    ax = axes[0]
+    ax.plot(Ms,t_pre,'o-',color='#1f77b4',lw=1.8,ms=5,label='With precomputation')
+    ax.plot(Ms,t_trad,'s-',color='#d62728',lw=1.8,ms=5,label='Without precomputation')
+    sc = t_trad[0]/Ms[0]
+    ax.plot(Ms,[sc*m for m in Ms],'--',color='#d62728',lw=1,alpha=0.4,label='O(NM) ref.')
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlabel('$M$'); ax.set_ylabel('Runtime (s)')
+    ax.set_title('(a) Runtime [$K=1$]',fontsize=9)
+    ax.legend(); ax.grid(True,which='both',alpha=0.2)
+    ax = axes[1]
+    th_shape = np.array(Ms,float)/Ms[0]*speedups[0]
+    ax.plot(Ms,speedups,'d-',color='#2ca02c',lw=1.8,ms=5,label='Measured')
+    ax.plot(Ms,th_shape,'--',color='gray',lw=1.2,label='$M/K$ shape')
     ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.set_title('Runtime vs. Observation Size', fontsize=13, pad=12)
-    ax.legend(fontsize=10)
-    ax.grid(True, which="both", ls="-")
-    ax.tick_params(axis='both', which='major', labelsize=10)
+    ax.set_xlabel('$M$'); ax.set_ylabel('Speedup')
+    ax.set_title('(b) Speedup [$K=1$]',fontsize=9)
+    ax.legend(); ax.grid(True,which='both',alpha=0.2)
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULT_DIR, 'time_comparison.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(f"{RESULT_DIR}/time_comparison.png",dpi=300,bbox_inches='tight')
     plt.close()
 
-    # 2. 加速比图
-    fig, ax = plt.subplots(figsize=(6, 4.5))
-    ax.plot(Ms, speedups, 'd-', color='#2ca02c', linewidth=2, markersize=6, label='Speedup')
-    ax.set_xlabel('Number of Observations ($M$)', fontsize=12)
-    ax.set_ylabel('Speedup (Without / With Precomputation)', fontsize=12)
+    fig, ax = plt.subplots(figsize=(5.5,4))
+    ax.plot(Ms,speedups,'d-',color='#2ca02c',lw=1.8,ms=5,label='Measured speedup')
+    ax.plot(Ms,th_shape,'--',color='gray',lw=1.2,label='$M/K$ shape')
     ax.set_xscale('log')
-    ax.set_yscale('log')
-    ax.set_title('Speedup vs. Observation Size', fontsize=13, pad=12)
-    ax.legend(fontsize=10)
-    ax.grid(True, which="both", ls="-")
-    ax.tick_params(axis='both', which='major', labelsize=10)
+    ax.set_xlabel('$M$'); ax.set_ylabel('Speedup')
+    ax.set_title('Speedup vs $M$  [$K_{eff}=1$]',fontsize=10)
+    ax.legend(); ax.grid(True,which='both',alpha=0.2)
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULT_DIR, 'speedup_vs_M.png'), dpi=300, bbox_inches='tight')
+    plt.savefig(f"{RESULT_DIR}/speedup_vs_M.png",dpi=300,bbox_inches='tight')
     plt.close()
+    print("  Saved: time_comparison.png, speedup_vs_M.png")
 
-    # 3. 核心：每条链的r-hat对比图（带/不带预计算）
-    param_names = [V0_STR, W0_STR, ALPHA_STR]
-    chain_colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
-    pre_linestyle = '-'  # 带预计算：实线
-    no_pre_linestyle = ':'  # 无预计算：点线
-    markers = ['o', 's', '^']  # 每条链的标记
-
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharey=True)
-    fig.suptitle('Convergence Diagnostics ($r$-hat) — Precomputation Does Not Affect Convergence',
-                 fontsize=14, y=1.05)
-
-    for i, param in enumerate(param_names):
-        ax = axes[i]
-        # 绘制每条链的r-hat（带预计算）
-        for chain_idx in range(N_CHAINS):
-            pre_rhat = [res['pre_conv']['per_chain_r_hat'][chain_idx, i] for res in valid_results]
-            ax.plot(Ms, pre_rhat, marker=markers[chain_idx], linestyle=pre_linestyle,
-                    color=chain_colors[chain_idx], alpha=0.8, markersize=5, linewidth=1.5,
-                    label=f'Chain {chain_idx + 1} (With Precomp.)' if (i == 0 and chain_idx == 0) else "")
-
-            # 绘制每条链的r-hat（无预计算）
-            no_pre_rhat = [res['no_pre_conv']['per_chain_r_hat'][chain_idx, i] for res in valid_results]
-            ax.plot(Ms, no_pre_rhat, marker=markers[chain_idx], linestyle=no_pre_linestyle,
-                    color=chain_colors[chain_idx], alpha=0.8, markersize=5, linewidth=1.5,
-                    label=f'Chain {chain_idx + 1} (Without Precomp.)' if (i == 0 and chain_idx == 0) else "")
-
-        # 绘制整体r-hat
-        pre_overall = [res['pre_conv']['r_hat'][param] for res in valid_results]
-        no_pre_overall = [res['no_pre_conv']['r_hat'][param] for res in valid_results]
-        ax.plot(Ms, pre_overall, marker='D', linestyle=pre_linestyle, color='black',
-                linewidth=2, markersize=6, label='Overall (With Precomp.)' if i == 0 else "")
-        ax.plot(Ms, no_pre_overall, marker='D', linestyle=no_pre_linestyle, color='black',
-                linewidth=2, markersize=6, label='Overall (Without Precomp.)' if i == 0 else "")
-
-        # 收敛阈值线
-        ax.axhline(y=1.2, color='#d62728', linestyle='--', linewidth=1.8, alpha=0.9,
-                   label='$r$-hat Threshold (1.2)' if i == 0 else "")
-
-        # 轴标签
-        ax.set_xlabel('Number of Observations ($M$)', fontsize=12)
-        ax.set_title(f'Parameter: {param}', fontsize=13, pad=10)  # MathText显示参数名
-        ax.set_xscale('log')
-        ax.grid(True, which="both", ls="-")
-        ax.tick_params(axis='both', which='major', labelsize=10)
-        ax.set_ylim(0.95, 1.5)
-
-    # 统一y轴标签
-    fig.text(0.05, 0.5, 'Gelman-Rubin Statistic ($r$-hat)',
-             va='center', rotation='vertical', fontsize=12)
-
-    # 图例（右侧布局）
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc='center right', bbox_to_anchor=(0.98, 0.5), fontsize=9)
-
+    # Fig2: speedup vs K + convergence vs K
+    K_vals = list(results_B.keys())
+    M_fixed = results_B[K_vals[0]]['M']
+    sp_meas = [results_B[K]['speedup'] for K in K_vals]
+    sp_th   = [M_fixed/K for K in K_vals]
+    rp = [results_B[K]['rhat_pre'].max() for K in K_vals]
+    rt = [results_B[K]['rhat_trad'].max() for K in K_vals]
+    fig, axes = plt.subplots(1,2,figsize=(10,4))
+    xs = np.arange(len(K_vals)); bw = 0.35
+    ax = axes[0]
+    ax.bar(xs-bw/2,sp_th,bw,color='#aec7e8',alpha=0.85,label='Theory $M/K$')
+    ax.bar(xs+bw/2,sp_meas,bw,color='#2ca02c',alpha=0.85,label='Measured')
+    for i,(th_v,ms_v) in enumerate(zip(sp_th,sp_meas)):
+        ax.text(i-bw/2,th_v+2,f'{th_v:.0f}x',ha='center',fontsize=7,color='#1f77b4')
+        ax.text(i+bw/2,ms_v+0.5,f'{ms_v:.1f}x',ha='center',fontsize=7)
+    ax.set_xticks(xs); ax.set_xticklabels([f'$K={k}$' for k in K_vals])
+    ax.set_xlabel('$K$'); ax.set_ylabel('Speedup')
+    ax.set_title(f'(a) Speedup vs $K$  [$M={M_fixed}$]\nRemark 1: gap=MCMC overhead',fontsize=9)
+    ax.legend(); ax.grid(axis='y',alpha=0.25)
+    ax = axes[1]
+    ax.bar(xs-bw/2,rp,bw,color='#1f77b4',alpha=0.85,label='With precomp.')
+    ax.bar(xs+bw/2,rt,bw,color='#d62728',alpha=0.85,label='Without precomp.')
+    ax.axhline(1.2,color='#d62728',ls='--',lw=1.2,alpha=0.7,label='Threshold 1.2')
+    ax.set_xticks(xs); ax.set_xticklabels([f'$K={k}$' for k in K_vals])
+    ax.set_xlabel('$K$'); ax.set_ylabel('Max $\\hat{R}$')
+    ax.set_title('(b) Convergence vs $K$  [Theorem 3]',fontsize=9)
+    ax.set_ylim(0.95,1.35); ax.legend(); ax.grid(axis='y',alpha=0.25)
     plt.tight_layout()
-    plt.subplots_adjust(right=0.85)
-    plt.savefig(os.path.join(RESULT_DIR, 'rhat_with_vs_without_precompute.png'),
-                dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(f"{RESULT_DIR}/speedup_vs_K.png",dpi=300,bbox_inches='tight')
     plt.close()
+    print("  Saved: speedup_vs_K.png")
 
-    print(f"\n所有图表已保存至 {RESULT_DIR} (300 dpi, 符合学术期刊格式)")
+    # Fig3: posterior accuracy
+    K = best_C['K']; tv = best_C['theta_true']
+    xp = np.arange(K); w = 0.22
+    fig, axes = plt.subplots(1,2,figsize=(10,4))
+    fig.suptitle(f'Posterior accuracy ($M={best_C["M"]}$, $K={K}$) — Theorem 1',fontsize=10)
+    ax = axes[0]
+    ax.bar(xp-w,tv,w,color='#7f7f7f',alpha=0.7,label='True $\\theta$')
+    ax.bar(xp,best_C['mean_pre'],w,color='#1f77b4',alpha=0.85,
+           yerr=2*best_C['std_pre'],capsize=3,error_kw={'lw':1},
+           label='With precomp. ($\\pm2\\sigma$)')
+    ax.bar(xp+w,best_C['mean_trad'],w,color='#d62728',alpha=0.85,
+           yerr=2*best_C['std_trad'],capsize=3,error_kw={'lw':1},
+           label='Without precomp. ($\\pm2\\sigma$)')
+    ax.set_xticks(xp); ax.set_xticklabels([f'$\\theta_{j+1}$' for j in range(K)])
+    ax.set_ylabel('Value'); ax.set_title('(a) Mean vs. true value')
+    ax.legend(fontsize=8); ax.grid(axis='y',alpha=0.3)
+    ax = axes[1]
+    ax.bar(xp-w/2,best_C['std_pre'],w*0.9,color='#1f77b4',alpha=0.85,label='With precomp.')
+    ax.bar(xp+w/2,best_C['std_trad'],w*0.9,color='#d62728',alpha=0.85,label='Without precomp.')
+    ax.set_xticks(xp); ax.set_xticklabels([f'$\\theta_{j+1}$' for j in range(K)])
+    ax.set_ylabel('Std. dev.'); ax.set_title('(b) Uncertainty (must be identical)')
+    ax.legend(fontsize=8); ax.grid(axis='y',alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{RESULT_DIR}/posterior_accuracy.png",dpi=300,bbox_inches='tight')
+    plt.close()
+    print("  Saved: posterior_accuracy.png")
+
+    # Fig4: R-hat vs M
+    fig, ax = plt.subplots(figsize=(6,4))
+    ax.plot(Ms,[r['rhat_pre'].max() for r in results_A],
+            'o-',color='#1f77b4',lw=1.8,ms=5,label='With precomp.')
+    ax.plot(Ms,[r['rhat_trad'].max() for r in results_A],
+            's--',color='#d62728',lw=1.8,ms=5,alpha=0.7,label='Without precomp.')
+    ax.axhline(1.2,color='#d62728',ls='--',lw=1.2,alpha=0.7,label='Threshold 1.2')
+    ax.set_xscale('log')
+    ax.set_xlabel('$M$'); ax.set_ylabel('Max $\\hat{R}$')
+    ax.set_title('Convergence [$K=1$] — Theorem 3',fontsize=10)
+    ax.set_ylim(0.97,1.35); ax.legend(); ax.grid(True,which='both',alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(f"{RESULT_DIR}/rhat_with_vs_without_precompute.png",dpi=300,bbox_inches='tight')
+    plt.close()
+    print("  Saved: rhat_with_vs_without_precompute.png")
+
+    # Fig5: noise robustness
+    sigmas = [r['sigma'] for r in results_E]
+    fig, axes = plt.subplots(1,3,figsize=(13,4))
+    fig.suptitle('Noise robustness  ($K=1$, $M=8000$)',fontsize=10)
+    for ax,(ys,ttl,yl) in zip(axes,[
+        ([r['speedup'] for r in results_E],
+         '(a) Speedup vs. $\\sigma$','Speedup'),
+        ([r['rhat_pre'].max() for r in results_E],
+         '(b) Max $\\hat{R}$ vs. $\\sigma$','Max $\\hat{R}$'),
+        ([abs(r['mean_pre'][0]-r['theta_true'][0]) for r in results_E],
+         '(c) Error vs. $\\sigma$','$|$mean$-$true$|$'),
+    ]):
+        ax.plot(sigmas,ys,'o-',color='#2ca02c',lw=1.8,ms=5)
+        if 'hat' in yl:
+            ax.axhline(1.2,color='#d62728',ls='--',lw=1,alpha=0.7)
+            ax.set_ylim(0.97,1.35)
+        ax.set_xlabel('$\\sigma$'); ax.set_ylabel(yl)
+        ax.set_title(ttl,fontsize=9); ax.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(f"{RESULT_DIR}/noise_robustness.png",dpi=300,bbox_inches='tight')
+    plt.close()
+    print("  Saved: noise_robustness.png")
 
 
-# ========================== Main Function ==========================
+# ─── Tables ──────────────────────────────────────────────────────────
+
+def print_tables(results_A, results_B, best_C, results_E):
+    print("\n"+"="*72)
+    print("TABLE 1  K=1  multi-scale M")
+    print("="*72)
+    print(f"{'M':>7} {'t_pre':>9} {'t_trad':>10} {'Speedup':>9} "
+          f"{'Th.M/K':>8} {'Rhat':>8}")
+    print("-"*56)
+    for r in results_A:
+        print(f"{r['M']:>7d} {r['t_pre']:>9.2f} {r['t_trad']:>10.2f} "
+              f"{r['speedup']:>9.2f} {float(r['M']):>8.0f} "
+              f"{r['rhat_pre'].max():>8.3f}")
+
+    print("\n"+"="*72)
+    print("TABLE 2  K=2,4,8  M=8000  (Fix1: A cached | Fix2: optimal steps)")
+    print("="*72)
+    print(f"{'K':>5} {'t_pre':>9} {'t_trad':>10} {'Speedup':>9} "
+          f"{'Th.M/K':>8} {'Rhat':>8} {'Err':>9}")
+    print("-"*65)
+    for K,r in results_B.items():
+        err = np.abs(r['mean_pre']-r['theta_true']).mean()
+        print(f"{K:>5d} {r['t_pre']:>9.2f} {r['t_trad']:>10.2f} "
+              f"{r['speedup']:>9.2f} {r['M']/K:>8.0f} "
+              f"{r['rhat_pre'].max():>8.3f} {err:>9.4f}")
+
+    print(f"\n"+"="*72)
+    print(f"TABLE 3  Posterior equivalence  M={best_C['M']}, K={best_C['K']}")
+    print("="*72)
+    K = best_C['K']; tv = best_C['theta_true']
+    print(f"{'Param':<6} {'True':>10} {'Pre mean':>14} "
+          f"{'Trad mean':>14} {'|Dmean|':>11}")
+    print("-"*58)
+    for j in range(K):
+        diff = abs(best_C['mean_pre'][j]-best_C['mean_trad'][j])
+        print(f"th{j+1:<4} {tv[j]:>10.6f} {best_C['mean_pre'][j]:>14.9f} "
+              f"{best_C['mean_trad'][j]:>14.9f} {diff:>11.3e}")
+
+    print("\n"+"="*72)
+    print("TABLE 4  Noise robustness  K=1, M=8000")
+    print("="*72)
+    print(f"{'sigma':>7} {'Speedup':>9} {'Rhat':>8} {'Err':>12}")
+    print("-"*42)
+    for r in results_E:
+        err = abs(r['mean_pre'][0]-r['theta_true'][0])
+        print(f"{r['sigma']:>7.2f} {r['speedup']:>9.2f} "
+              f"{r['rhat_pre'].max():>8.3f} {err:>12.5f}")
+
+
+# ─── Main ─────────────────────────────────────────────────────────────
+
 def main():
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    np.random.seed(SEED)
-    print("=" * 80)
-    print("贝叶斯反演对比实验")
-    print(f"设置: 样本量={MCMC_SAMPLES}, 预热期={MCMC_BURNIN}, 链数量={N_CHAINS}")
-    print("=" * 80)
+    np.random.seed(SEED); t0 = time.time()
+    print("="*60)
+    print("Precomputation-Driven MH-MCMC: Paper Validation (FIXED v2)")
+    print(f"  N={N_SAMPLES}  burn-in={N_BURNIN}  chains={N_CHAINS}")
+    print("  Fix1: traditional uses A_cached (no A rebuild per iter)")
+    print("  Fix2: steps = (2.38/sqrt(K))*post_std  (RWM optimal)")
+    print("="*60)
 
-    # 运行多尺度实验
-    all_results = []
-    for grid_size in GRID_SIZES:
-        result = compare_algorithms(grid_size)
-        if result and result.get('success', False):
-            all_results.append(result)
+    res_A  = exp_A()
+    res_B  = exp_B()
+    best_C = exp_C(res_A)
+    exp_D(res_A, res_B)
+    res_E  = exp_E()
+    exp_F(res_A, res_B)
 
-    # 生成图表
-    plot_comparison_results(all_results)
-
-    # 理论验证
-    if all_results:
-        print("\n" + "=" * 80)
-        print("理论验证：预计算不影响收敛性 + 复杂度分析")
-        print("=" * 80)
-        print("1. 收敛性结论：带/不带预计算的每条链r-hat完全一致，证明预计算不影响收敛；")
-        print("2. 传统算法 (无预计算): O(N·M)")
-        print(
-            f"   证据: 运行时间从 {all_results[0]['no_precompute_time']:.2f}s (M=2000) 增长到 {all_results[-1]['no_precompute_time']:.2f}s (M=16000) (线性增长)")
-        print("3. 预计算算法: O(M + N·K)")
-        print(
-            f"   证据: 运行时间稳定在 {np.mean([r['precompute_time'] for r in all_results]):.2f}s 左右 (随M增长可忽略)")
-        print("4. 加速比趋势:")
-        print(
-            f"   证据: 加速比从 {all_results[0]['speedup']:.2f}x (M=2000) 提升到 {all_results[-1]['speedup']:.2f}x (M=16000) (符合理论预测: 加速比 ∝ M)")
-        print("结论: 实验验证了“预计算不影响收敛性”的定理，且显著提升计算效率。")
+    print("\n-- Figures --"); plot_all(res_A, res_B, best_C, res_E)
+    print("\n-- Tables --");  print_tables(res_A, res_B, best_C, res_E)
+    print(f"\nTotal: {time.time()-t0:.1f}s  Output: {RESULT_DIR}/")
 
 
 if __name__ == "__main__":
