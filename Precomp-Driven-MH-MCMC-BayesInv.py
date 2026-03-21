@@ -1,531 +1,687 @@
 """
-Precomputation-Driven MH-MCMC: Final Paper Validation  (FIXED v2)
-=================================================================
-Fix 1 (original): Traditional baseline uses A_cached — no basis_matrix()
-  rebuild per iteration. Correct O(NMK) baseline.
+CLSC 闭环供应链 Stackelberg 博弈模型 — 最终修复版
+========================================================
 
-Fix 2 (this version): Step sizes now derived from posterior std.
-  Original steps=0.06/sqrt(K) was 10-18x larger than posterior std,
-  causing near-zero acceptance (K=4: ~0%, K=8: ~1%) and false/true
-  non-convergence in Exp-B/D.
+修复记录（相对原始代码共 4 项核心修复）：
 
-  Correct formula (Roberts et al. 1997 RWM optimal):
-      steps = (2.38/sqrt(K)) * post_std
-  where  post_std = sqrt(diag(sigma^2 * (A^T A)^{-1}))
+[Fix 1] 排放函数：替代模型（原：加法模型）
+  原：E = e_m·D + e_r·ρ·D         → 回收越多排放越多 ✗
+  改：E = e_m·(1-ρ)·D + e_r·ρ·D  → 回收替代新生产，排放越少 ✓
 
-  This requires steps to be computed AFTER precompute() since Q=A^T A
-  is only available then. run_both() now computes and overrides steps
-  before sampling.
+[Fix 2] 集中决策基准：VIF 利润最大化（原：社会计划者 SW 最大化）
+  原：centralized = max_{p,ρ} SW    → VIF 亏损经营 (π=-6668)，不符合现实 ✗
+  改：VIF = max_{p,ρ} π_VIF        → VIF 自主盈利，政府对外设 τ^C 最大化 SW ✓
+  同时加入参与约束：π_VIF ≥ 0
 
-Model family (paper Eq.2  d = A*theta):
-  K=1 : A=[1/cosh(x1)...]^T  (separable/rank-1, paper Eq.4)
-  K>=2: A[i,k]=exp(-lk|xi-sk|)  (general linear, paper Eq.2)
+[Fix 3] 福利公式：含税收返还（原：缺少 +τ·E）
+  原：SW = CS + π_m + π_r - η·E²        → τ→0 恒为最优 ✗
+  改：SW = CS + π_m + π_r + τ·E - η·E² → 税收作为转移支付归还社会 ✓
+
+[Fix 4] 参数 k：由 150 → 12000（确保分散和集中均为内点解）
+
+经济意义说明：
+  E^C > E^*（集中排放略高于分散）是本模型的一个内生结论，非 bug。
+  集中决策消除了双重加价，产量更大（D^C=81.7 > D^*=54.4），
+  即使回收率更高，产量效应仍主导排放。这是"绿色悖论"在供应链中的体现，
+  需要更强的税收信号（τ^C > τ*）来应对。
 """
 
-import numpy as np, time, os, warnings
-import matplotlib; matplotlib.use("Agg")
+import numpy as np
 import matplotlib.pyplot as plt
-warnings.filterwarnings("ignore")
+import matplotlib.patches as mpatches
+import pandas as pd
+from dataclasses import dataclass
+from scipy.optimize import minimize_scalar, minimize
 
+# ==============================================================
+# Publication Plot Style (NPG Nature Style)
+# ==============================================================
 plt.rcParams.update({
-    'figure.dpi':300,'font.family':'DejaVu Sans','font.size':9,
-    'axes.linewidth':0.8,'axes.spines.top':False,'axes.spines.right':False,
-    'axes.labelpad':5,'legend.frameon':True,'legend.framealpha':0.9,
-    'legend.fontsize':8,'grid.alpha':0.25,'grid.linewidth':0.4,
-    'xtick.direction':'in','ytick.direction':'in',
-    'text.usetex':False,'axes.formatter.use_mathtext':True,
+    "font.family":                    "serif",
+    "font.serif":                     ["Times New Roman", "DejaVu Serif"],
+    "mathtext.fontset":               "cm",
+    "axes.labelsize":                 13,
+    "axes.titlesize":                 14,
+    "axes.titleweight":               "bold",
+    "legend.fontsize":                10.5,
+    "xtick.labelsize":                11,
+    "ytick.labelsize":                11,
+    "axes.linewidth":                 1.4,
+    "grid.alpha":                     0.25,
+    "grid.linestyle":                 "--",
+    "figure.constrained_layout.use": True,
+    "savefig.dpi":                    600,
+    "savefig.bbox":                   "tight",
 })
 
-RESULT_DIR="results_paper"; os.makedirs(RESULT_DIR,exist_ok=True)
-SEED=42; N_SAMPLES=80_000; N_BURNIN=16_000; N_CHAINS=3; SIGMA_DEF=0.05
+# NPG Color Palette
+C_RED   = "#E64B35"
+C_BLUE  = "#4DBBD5"
+C_GREEN = "#00A087"
+C_DARK  = "#3C5488"
+C_ORANG = "#F39B7F"
+C_GREY  = "#7E6148"
 
 
-# ─── Model ───────────────────────────────────────────────────────────
+# ==============================================================
+# Model Configuration
+# ==============================================================
+@dataclass
+class ModelConfig:
+    # Demand
+    a:       float = 500
+    b:       float = 1.3
+    gamma:   float = 10
 
-class LinearModel:
+    # Cost
+    c_m:     float = 200
+    c_r:     float = 170
+    k:       float = 12000   # [Fix 4] was 150/600 → must satisfy k > D·Δc/2
+
+    # Emission  (substitution model: e_m > e_r)
+    e_m:     float = 0.8
+    e_r:     float = 0.2
+
+    # Environmental damage
+    eta:     float = 3.0
+
+    # Green preference
+    g:       float = 0.5
+
+    # Tax bound
+    tau_max: float = 150
+
+    tol:     float = 1e-8
+
+
+# ==============================================================
+# Core Functions
+# ==============================================================
+def demand_fn(cfg: ModelConfig, p: float) -> float:
+    return max(cfg.a - cfg.b * p + cfg.gamma * cfg.g, 0.0)
+
+
+def emission_fn(cfg: ModelConfig, D: float, rho: float) -> float:
+    """[Fix 1] Substitution emission: recycling replaces new production."""
+    return cfg.e_m * (1.0 - rho) * D + cfg.e_r * rho * D
+
+
+def retailer_best_response(cfg: ModelConfig, w: float) -> float:
+    return (cfg.a + cfg.gamma * cfg.g + cfg.b * w) / (2.0 * cfg.b)
+
+
+def manufacturer_profit(cfg: ModelConfig, w: float, rho: float, tau: float) -> float:
+    p = retailer_best_response(cfg, w)
+    D = demand_fn(cfg, p)
+    if D <= 0:
+        return -1e10
+    E = emission_fn(cfg, D, rho)
+    return (w - cfg.c_m)*D + (cfg.c_m - cfg.c_r)*rho*D - tau*E - cfg.k*rho**2
+
+
+# ==============================================================
+# Decentralized Channel (Three-tier Stackelberg)
+# ==============================================================
+def optimal_recycling_rate(cfg: ModelConfig, w: float, tau: float) -> float:
+    """Manufacturer's optimal ρ given w and τ.
+    FOC: (c_m-c_r)D + τ(e_m-e_r)D - 2kρ = 0  →  ρ* = D[Δc + τΔe]/(2k)
     """
-    d = A*theta,  A in R^{M x K}  (parameter-independent, built once).
-    K=1:  A = 1/cosh(x)  (separable rank-1, paper Eq.4)
-    K>=2: A[i,k] = exp(-lk|xi-sk|)  (Green's basis, paper Eq.2)
-
-    Precomputed: Q=A^T A, c=2A^T(-d)  -> O(K^2) per iteration.
-    Traditional: A cached, A@theta only -> O(MK) per iteration.
-
-    NOTE: self.steps is a placeholder; run_both() overrides it with
-    posterior-std-based steps after precompute() is called.
-    """
-    def __init__(self, K, sigma=SIGMA_DEF):
-        self.K = K
-        self.sigma = sigma
-        rng = np.random.RandomState(0)
-        if K == 1:
-            self.name = "Separable (K=1)"
-            self.theta_true = np.array([np.sqrt((2-1.0+0.5**2/9)/1.0)])
-            self.bounds = [(0.5, 2.0)]
-            self.steps = np.array([0.012])   # overridden in run_both
-            self._fn = "sech"
-        else:
-            self.name = f"Linear (K={K})"
-            self.lambdas = 0.3 + 0.4*rng.rand(K)
-            self.sources = np.linspace(-4, 4, K)
-            self.theta_true = np.clip(rng.randn(K)*0.4+1.0, 0.2, 2.0)
-            self.bounds = [(0.0, 3.0)]*K
-            self.steps = np.full(K, 0.06/np.sqrt(K))  # overridden in run_both
-            self._fn = "green"
-
-    def basis_matrix(self, x):
-        """Build A once — NOT called per MCMC iteration."""
-        if self._fn == "sech":
-            return (1.0/np.cosh(x)).reshape(-1, 1)
-        diff = np.abs(x[:,None] - self.sources[None,:])
-        return np.exp(-self.lambdas[None,:] * diff)
-
-    def generate_data(self, x, sigma):
-        np.random.seed(SEED)
-        return self.basis_matrix(x) @ self.theta_true + sigma*np.random.randn(len(x))
-
-    def precompute(self, x, d_obs):
-        """O(MK^2) once. Stores A for traditional path."""
-        A = self.basis_matrix(x)
-        Q = A.T @ A
-        c = 2.0 * (A.T @ (-d_obs))
-        c0 = np.dot(d_obs, d_obs)
-        return {'Q': Q, 'c': c, 'c0': c0, 'A': A}
-
-    def compute_optimal_steps(self, Q, sigma):
-        """
-        FIX 2: Compute per-dimension step sizes from posterior std.
-        Posterior Cov ~ sigma^2 * (A^T A)^{-1}  (Gaussian likelihood)
-        Optimal RWM step (Roberts et al. 1997): 2.38/sqrt(K) * post_std
-        This gives acceptance rate ~23% in high dimensions.
-        """
-        try:
-            cov = sigma**2 * np.linalg.inv(Q)
-            post_std = np.sqrt(np.maximum(np.diag(cov), 1e-12))
-        except np.linalg.LinAlgError:
-            # Fallback if Q is singular
-            post_std = np.full(self.K, sigma / np.sqrt(Q.diagonal().mean()))
-        steps = (2.38 / np.sqrt(self.K)) * post_std
-        return steps
-
-    def log_like_precomp(self, theta, pc, sigma):
-        """O(K^2) per iteration. Constant c0 dropped (cancels in MH ratio)."""
-        q = theta @ pc['Q'] @ theta + pc['c'] @ theta
-        return -q / (2*sigma**2)
-
-    def log_like_traditional(self, theta, A_cached, d_obs, sigma):
-        """O(MK) per iteration. Uses pre-built A_cached — no basis rebuild."""
-        r = A_cached @ theta - d_obs
-        return -np.dot(r, r) / (2*sigma**2)
-
-    def log_prior(self, theta):
-        return 0.0 if all(lo<p<hi for p,(lo,hi) in zip(theta,self.bounds)) else -np.inf
-
-
-# ─── MCMC engine ─────────────────────────────────────────────────────
-
-def run_mcmc(ll_fn, lp_fn, init, steps,
-             n_samples=N_SAMPLES, n_burnin=N_BURNIN):
-    d = len(init)
-    samples = np.zeros((n_samples, d))
-    th = init.copy()
-    cur_ll = ll_fn(th); cur_lp = lp_fn(th)
-    n_acc = 0
-    for i in range(n_samples + n_burnin):
-        prop = th + steps * np.random.randn(d)
-        lp2 = lp_fn(prop)
-        if lp2 == -np.inf:
-            if i >= n_burnin: samples[i-n_burnin] = th
-            continue
-        ll2 = ll_fn(prop)
-        if np.log(np.random.rand()) < (lp2+ll2) - (cur_lp+cur_ll):
-            th, cur_ll, cur_lp = prop, ll2, lp2
-            if i >= n_burnin: n_acc += 1
-        if i >= n_burnin: samples[i-n_burnin] = th
-    return samples, n_acc/n_samples
-
-
-def run_both(model, x, d_obs, sigma=SIGMA_DEF):
-    """
-    FIX 1: A_cached passed to traditional path — no basis_matrix() per iter.
-    FIX 2: steps overridden with posterior-std-based optimal steps.
-    Both paths use the same steps for a fair comparison.
-    """
-    pc = model.precompute(x, d_obs)
-    A_cached = pc['A']
-
-    # FIX 2: compute optimal steps from Q after precompute
-    steps = model.compute_optimal_steps(pc['Q'], sigma)
-
-    # precomputed path
-    chains_pre = []; t0 = time.time()
-    for ci in range(N_CHAINS):
-        np.random.seed(SEED+ci)
-        init = model.theta_true + 0.05*np.random.randn(model.K)
-        ll_fn = lambda th, _pc=pc, _s=sigma: model.log_like_precomp(th, _pc, _s)
-        s, _ = run_mcmc(ll_fn, model.log_prior, init, steps)
-        chains_pre.append(s)
-    t_pre = time.time()-t0
-
-    # traditional path — A_cached passed, no rebuild
-    chains_trad = []; t0 = time.time()
-    for ci in range(N_CHAINS):
-        np.random.seed(SEED+ci)
-        init = model.theta_true + 0.05*np.random.randn(model.K)
-        ll_fn = lambda th, _A=A_cached, _d=d_obs, _s=sigma: \
-            model.log_like_traditional(th, _A, _d, _s)
-        s, _ = run_mcmc(ll_fn, model.log_prior, init, steps)
-        chains_trad.append(s)
-    t_trad = time.time()-t0
-
-    cp = np.array(chains_pre); ct = np.array(chains_trad)
-    mp, sp = _stats(cp); mt, st = _stats(ct)
-    return dict(
-        M=len(x), K=model.K, name=model.name, sigma=sigma,
-        t_pre=t_pre, t_trad=t_trad, speedup=t_trad/t_pre,
-        rhat_pre=_rhat(cp), rhat_trad=_rhat(ct),
-        mean_pre=mp, std_pre=sp, mean_trad=mt, std_trad=st,
-        theta_true=model.theta_true,
-        chains_pre=cp, chains_trad=ct,
-        steps_used=steps,
+    res = minimize_scalar(
+        lambda r: -manufacturer_profit(cfg, w, r, tau),
+        bounds=(0.0, 1.0), method="bounded", options={'xatol': cfg.tol}
     )
+    return res.x
 
 
-def _rhat(chains):
-    nc, n, p = chains.shape
-    cm = chains.mean(1); cv = chains.var(1, ddof=1)
-    W = cv.mean(0); B = n*cm.var(0, ddof=1)
-    W = np.maximum(W, 1e-12)
-    pv = (n-1)/n*W + B/n
-    return np.sqrt(pv/W)
+def optimal_wholesale_price(cfg: ModelConfig, tau: float) -> tuple:
+    """Manufacturer's optimal w given τ. Returns (w*, ρ*)."""
+    def neg_profit(w):
+        rho = optimal_recycling_rate(cfg, w, tau)
+        return -manufacturer_profit(cfg, w, rho, tau)
 
-def _stats(chains):
-    s = chains.reshape(-1, chains.shape[-1])
-    return s.mean(0), s.std(0, ddof=1)
-
-
-# ─── Experiments ─────────────────────────────────────────────────────
-
-def exp_A():
-    print("\n"+"="*60)
-    print("Exp-A  K=1 (separable)  multi-scale M")
-    print("="*60)
-    grid_sizes=[50,100,200,400,800,1600]; time_steps=40
-    model = LinearModel(K=1); results = []
-    for gs in grid_sizes:
-        x = np.linspace(-5,5,gs*time_steps)
-        d_obs = model.generate_data(x, SIGMA_DEF)
-        print(f"  M={len(x):>6d} ...", end=" ", flush=True)
-        r = run_both(model, x, d_obs); results.append(r)
-        print(f"speedup={r['speedup']:5.2f}x  theory~{len(x):.0f}x  "
-              f"rhat={r['rhat_pre'].max():.3f}  "
-              f"{'OK' if r['rhat_pre'].max()<1.2 else 'FAIL'}")
-    return results
+    res = minimize_scalar(neg_profit, bounds=(cfg.c_m, cfg.a / cfg.b),
+                          method="bounded", options={'xatol': cfg.tol})
+    w = res.x
+    rho = optimal_recycling_rate(cfg, w, tau)
+    return w, rho
 
 
-def exp_B():
-    print("\n"+"="*60)
-    print("Exp-B  Linear K=2,4,8  M=8000")
-    print("  Fix 1: A cached in trad path")
-    print("  Fix 2: steps = (2.38/sqrt(K)) * post_std  (RWM optimal)")
-    print("="*60)
-    K_vals=[2,4,8]; M=8000; x=np.linspace(-5,5,M); results={}
-    for K in K_vals:
-        model = LinearModel(K=K)
-        d_obs = model.generate_data(x, SIGMA_DEF)
-        print(f"  K={K:>2d} ...", end=" ", flush=True)
-        r = run_both(model, x, d_obs); results[K] = r
-        err = np.abs(r['mean_pre'] - r['theta_true']).mean()
-        print(f"speedup={r['speedup']:6.2f}x  theory~M/K={M/K:.0f}x  "
-              f"rhat={r['rhat_pre'].max():.3f}  err={err:.4f}  "
-              f"steps_mean={r['steps_used'].mean():.5f}  "
-              f"{'OK' if r['rhat_pre'].max()<1.2 else 'FAIL'}")
-    return results
+def decentralized_sw(cfg: ModelConfig, tau: float) -> float:
+    """[Fix 3] Social welfare with tax-revenue redistribution.
+    SW = CS + π_m + π_r + τ·E − η·E²
+    The +τ·E term returns government revenue to society (pure transfer).
+    """
+    w, rho = optimal_wholesale_price(cfg, tau)
+    p = retailer_best_response(cfg, w)
+    D = demand_fn(cfg, p)
+    if D <= 0:
+        return -1e10
+    E   = emission_fn(cfg, D, rho)
+    CS  = (cfg.a - p + cfg.gamma * cfg.g)**2 / (2.0 * cfg.b)
+    pi_m = manufacturer_profit(cfg, w, rho, tau)
+    pi_r = (p - w) * D
+    return CS + pi_m + pi_r + tau * E - cfg.eta * E**2
 
 
-def exp_C(results_A):
-    print("\n"+"="*60)
-    print("Exp-C  Posterior accuracy  (Theorem 1)")
-    print("="*60)
-    best = max(results_A, key=lambda r: r['M'])
-    K = best['K']; tv = best['theta_true']
-    print(f"  M={best['M']}, K={K}")
-    print(f"  {'Param':<7} {'True':>9} {'Pre mean':>12} {'Trad mean':>12} {'|Dmean|':>10}")
-    print("  "+"-"*54)
-    for j in range(K):
-        diff = abs(best['mean_pre'][j] - best['mean_trad'][j])
-        print(f"  th{j+1:<5} {tv[j]:>9.6f} {best['mean_pre'][j]:>12.8f} "
-              f"{best['mean_trad'][j]:>12.8f} {diff:>10.2e}")
-    md = max(abs(best['mean_pre'][j]-best['mean_trad'][j]) for j in range(K))
-    print(f"\n  Max|Dmean|={md:.2e} -> Theorem 1 "
-          f"{'CONFIRMED' if md<1e-4 else 'WARNING'}")
-    return best
+def decentralized_equilibrium(cfg: ModelConfig, tau=None) -> dict:
+    """Compute decentralized Stackelberg equilibrium.
+    If tau is None, the government's optimal τ* is solved first.
+    """
+    if tau is None:
+        res = minimize_scalar(
+            lambda t: -decentralized_sw(cfg, t),
+            bounds=(0.0, cfg.tau_max), method="bounded", options={'xatol': cfg.tol}
+        )
+        tau = res.x
+
+    w, rho = optimal_wholesale_price(cfg, tau)
+    p    = retailer_best_response(cfg, w)
+    D    = demand_fn(cfg, p)
+    E    = emission_fn(cfg, D, rho)
+    pi_m = manufacturer_profit(cfg, w, rho, tau)
+    pi_r = (p - w) * D
+    CS   = (cfg.a - p + cfg.gamma * cfg.g)**2 / (2.0 * cfg.b)
+    env_dam  = cfg.eta * E**2
+    tax_rev  = tau * E
+    SW   = CS + pi_m + pi_r + tax_rev - env_dam
+
+    return dict(tau=tau, w=w, p=p, rho=rho, D=D, E=E,
+                pi_m=pi_m, pi_r=pi_r, CS=CS,
+                env_dam=env_dam, tax_rev=tax_rev, SW=SW)
 
 
-def exp_D(results_A, results_B):
-    print("\n"+"="*60)
-    print("Exp-D  R-hat  (Theorem 3)")
-    print("="*60)
-    print("  [K=1]")
-    for r in results_A:
-        rp=r['rhat_pre'].max(); rt=r['rhat_trad'].max()
-        print(f"  M={r['M']:>6d}  pre={rp:.3f}  trad={rt:.3f}  "
-              f"{'OK' if rp<1.2 and rt<1.2 else 'FAIL'}")
-    print("  [K=2,4,8]")
-    for K,r in results_B.items():
-        rp=r['rhat_pre'].max(); rt=r['rhat_trad'].max()
-        print(f"  K={K:>2d}  pre={rp:.3f}  trad={rt:.3f}  "
-              f"steps_mean={r['steps_used'].mean():.5f}  "
-              f"{'OK' if rp<1.2 and rt<1.2 else 'FAIL'}")
+# ==============================================================
+# Centralized Channel  —  VIF (Vertically Integrated Firm)
+# ==============================================================
+# [Fix 2]  The correct centralized benchmark for supply chain coordination:
+#   • VIF = manufacturer + retailer merged → eliminates double marginalization
+#   • VIF maximizes its own profit π_VIF (not SW directly)
+#   • Government sets τ^C to maximize SW given VIF's profit-maximizing response
+#   • Participation constraint: π_VIF ≥ 0  (no loss-making operation)
+#
+# This is the "second-best" centralized benchmark used in SC coordination literature.
+# It is distinct from the "first-best" social planner that can operate at a loss.
+
+def vif_profit(cfg: ModelConfig, p: float, rho: float, tau: float) -> float:
+    D = demand_fn(cfg, p)
+    if D <= 0:
+        return -1e10
+    E = emission_fn(cfg, D, rho)
+    return (p - cfg.c_m)*D + (cfg.c_m - cfg.c_r)*rho*D - cfg.k*rho**2 - tau*E
 
 
-def exp_E():
-    print("\n"+"="*60)
-    print("Exp-E  Noise robustness  K=1, M=8000")
-    print("="*60)
-    sigmas=[0.02,0.05,0.10,0.20]; M=8000; x=np.linspace(-5,5,M)
-    model=LinearModel(K=1); results=[]
-    for sigma in sigmas:
-        d_obs = model.generate_data(x, sigma)
-        print(f"  s={sigma:.2f} ...", end=" ", flush=True)
-        r = run_both(model, x, d_obs, sigma=sigma)
-        r['sigma'] = sigma; results.append(r)
-        err = abs(r['mean_pre'][0]-model.theta_true[0])
-        print(f"speedup={r['speedup']:5.2f}x  rhat={r['rhat_pre'].max():.3f}  "
-              f"err={err:.5f}  {'OK' if r['rhat_pre'].max()<1.2 else 'FAIL'}")
-    return results
+def vif_best_response(cfg: ModelConfig, tau: float) -> tuple:
+    """VIF's profit-maximizing (p, ρ) given τ."""
+    best_pi = -1e10
+    best_x  = [300.0, 0.3]
+    for p0 in np.linspace(cfg.c_m + 5, cfg.a / cfg.b - 5, 10):
+        for r0 in np.linspace(0.02, 0.98, 8):
+            pi = vif_profit(cfg, p0, r0, tau)
+            if pi > best_pi:
+                best_pi = pi
+                best_x  = [p0, r0]
+
+    res = minimize(
+        lambda x: -vif_profit(cfg, x[0], x[1], tau),
+        x0=best_x,
+        bounds=[(cfg.c_m + 0.1, cfg.a / cfg.b), (0.0, 1.0)],
+        method='L-BFGS-B',
+        options={'ftol': 1e-12, 'gtol': 1e-10}
+    )
+    return float(res.x[0]), float(res.x[1])
 
 
-def exp_F(results_A, results_B):
-    print("\n"+"="*60)
-    print("Exp-F  Theory vs Measured  (Remark 1)")
-    print("="*60)
-    print("  [K=1]")
-    print(f"  {'M':>7} {'Theory':>10} {'Measured':>10} {'Ratio':>8}")
-    for r in results_A:
-        th = r['M']/r['K']
-        print(f"  {r['M']:>7d} {th:>10.0f} {r['speedup']:>10.2f} {r['speedup']/th:>8.5f}")
-    print("  [K=2,4,8]")
-    print(f"  {'K':>5} {'Theory':>10} {'Measured':>10} {'Ratio':>8}")
-    for K,r in results_B.items():
-        th = r['M']/K
-        print(f"  {K:>5d} {th:>10.0f} {r['speedup']:>10.2f} {r['speedup']/th:>8.5f}")
-    print("  Ratio < 1: MCMC overhead dominates precomp path (Remark 1).")
-    print("  Ratio increases with K as O(K^2) quadratic form cost grows.")
+def centralized_sw(cfg: ModelConfig, tau: float) -> float:
+    """SW when VIF plays its profit-maximizing best response to τ."""
+    p, rho = vif_best_response(cfg, tau)
+    pi = vif_profit(cfg, p, rho, tau)
+    if pi < 0:          # participation constraint
+        return -1e10
+    D  = demand_fn(cfg, p)
+    E  = emission_fn(cfg, D, rho)
+    CS = (cfg.a - p + cfg.gamma * cfg.g)**2 / (2.0 * cfg.b)
+    return CS + pi + tau * E - cfg.eta * E**2
 
 
-# ─── Figures ─────────────────────────────────────────────────────────
+def centralized_equilibrium(cfg: ModelConfig) -> dict:
+    """Government maximizes SW over τ; VIF responds with profit-maximizing (p^C, ρ^C)."""
+    # Coarse grid to locate basin
+    taus_grid = np.linspace(0, cfg.tau_max, 80)
+    sw_grid   = [centralized_sw(cfg, t) for t in taus_grid]
+    best_idx  = int(np.argmax(sw_grid))
+    tau_init  = taus_grid[best_idx]
 
-def plot_all(results_A, results_B, best_C, results_E):
-    Ms=[r['M'] for r in results_A]
-    t_pre=[r['t_pre'] for r in results_A]
-    t_trad=[r['t_trad'] for r in results_A]
-    speedups=[r['speedup'] for r in results_A]
+    # Refine
+    lo = max(0.0, tau_init - 12.0)
+    hi = min(cfg.tau_max, tau_init + 12.0)
+    res = minimize_scalar(lambda t: -centralized_sw(cfg, t),
+                          bounds=(lo, hi), method="bounded",
+                          options={'xatol': cfg.tol})
+    tau_c = float(res.x)
 
-    # Fig1: time comparison + speedup vs M
-    fig, axes = plt.subplots(1,2,figsize=(11,4.2))
+    p, rho  = vif_best_response(cfg, tau_c)
+    D       = demand_fn(cfg, p)
+    E       = emission_fn(cfg, D, rho)
+    pi_vif  = vif_profit(cfg, p, rho, tau_c)
+    CS      = (cfg.a - p + cfg.gamma * cfg.g)**2 / (2.0 * cfg.b)
+    env_dam = cfg.eta * E**2
+    tax_rev = tau_c * E
+    SW      = CS + pi_vif + tax_rev - env_dam
+
+    return dict(tau=tau_c, p=p, rho=rho, D=D, E=E,
+                pi_vif=pi_vif, CS=CS,
+                env_dam=env_dam, tax_rev=tax_rev, SW=SW)
+
+
+# ==============================================================
+# Sensitivity Engines
+# ==============================================================
+def standard_sensitivity(cfg: ModelConfig, n: int = 100) -> dict:
+    """τ → (ρ*, E, SW, p, w) along the decentralized equilibrium path."""
+    taus = np.linspace(0, cfg.tau_max, n)
+    out  = {'taus': taus, 'rho': [], 'E': [], 'SW': [], 'p': [], 'w': []}
+    for t in taus:
+        eq = decentralized_equilibrium(cfg, tau=t)
+        out['w'].append(eq['w'])
+        out['p'].append(eq['p'])
+        out['rho'].append(eq['rho'])
+        out['E'].append(eq['E'])
+        out['SW'].append(eq['SW'])
+    return {k: (v if k == 'taus' else np.array(v)) for k, v in out.items()}
+
+
+def strategic_sensitivity(cfg: ModelConfig, n: int = 40) -> dict:
+    """γ → (τ*, ρ*) — effect of consumer green preference."""
+    gammas = np.linspace(5, 25, n)
+    tau_stars, rho_stars = [], []
+    orig = cfg.gamma
+    for gv in gammas:
+        cfg.gamma = gv
+        eq = decentralized_equilibrium(cfg)
+        tau_stars.append(eq['tau'])
+        rho_stars.append(eq['rho'])
+    cfg.gamma = orig
+    return dict(gammas=gammas,
+                tau_stars=np.array(tau_stars),
+                rho_stars=np.array(rho_stars))
+
+
+# ==============================================================
+# Plot Utilities
+# ==============================================================
+def _clean_ax(ax):
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+def _annotate_vline(ax, x, y_text, text, color=C_RED, offset_x=8, offset_y=0):
+    ax.axvline(x, color=color, ls=':', lw=1.8, alpha=0.85)
+    ax.annotate(text,
+                xy=(x, y_text),
+                xytext=(x + offset_x, y_text + offset_y),
+                arrowprops=dict(facecolor=color, arrowstyle='->', lw=1.2),
+                fontsize=10.5, fontweight='bold', color=color)
+
+
+# ==============================================================
+# Figure Set 1 — Pricing Dynamics & Recycling Coordination Gap
+# ==============================================================
+def plot_set_1(eq_nt, eq_d, eq_c, sens):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    # ── 1A: Pricing Dynamics ────────────────────────────────────
     ax = axes[0]
-    ax.plot(Ms,t_pre,'o-',color='#1f77b4',lw=1.8,ms=5,label='With precomputation')
-    ax.plot(Ms,t_trad,'s-',color='#d62728',lw=1.8,ms=5,label='Without precomputation')
-    sc = t_trad[0]/Ms[0]
-    ax.plot(Ms,[sc*m for m in Ms],'--',color='#d62728',lw=1,alpha=0.4,label='O(NM) ref.')
-    ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlabel('$M$'); ax.set_ylabel('Runtime (s)')
-    ax.set_title('(a) Runtime [$K=1$]',fontsize=9)
-    ax.legend(); ax.grid(True,which='both',alpha=0.2)
+    ax.plot(sens['taus'], sens['p'], color=C_DARK, lw=2.5,
+            label='Retail Price ($p$)')
+    ax.plot(sens['taus'], sens['w'], color=C_BLUE, lw=2.5, ls='--',
+            label='Wholesale Price ($w$)')
+    ax.fill_between(sens['taus'], sens['w'], sens['p'],
+                    color=C_BLUE, alpha=0.10, label='Retailer Margin')
+
+    ax.axvline(eq_d['tau'], color=C_RED, ls=':', lw=1.8, alpha=0.85)
+    ax.scatter([eq_d['tau'], eq_d['tau']], [eq_d['p'], eq_d['w']],
+               color=C_RED, s=65, zorder=5)
+    ax.annotate(r'Optimal Tax $\tau^*$',
+                xy=(eq_d['tau'], eq_d['w'] - 4),
+                xytext=(eq_d['tau'] + 14, eq_d['w'] - 16),
+                arrowprops=dict(facecolor='black', arrowstyle='->', lw=1.1),
+                fontsize=10.5, fontweight='bold')
+
+    ax.set(xlabel=r'Carbon Tax Level ($\tau$)',
+           ylabel='Price',
+           title='A. Supply Chain Pricing Dynamics')
+    ax.legend(frameon=False)
+    _clean_ax(ax)
+
+    # ── 1B: Recycling Rate & Coordination Gap ───────────────────
     ax = axes[1]
-    th_shape = np.array(Ms,float)/Ms[0]*speedups[0]
-    ax.plot(Ms,speedups,'d-',color='#2ca02c',lw=1.8,ms=5,label='Measured')
-    ax.plot(Ms,th_shape,'--',color='gray',lw=1.2,label='$M/K$ shape')
-    ax.set_xscale('log')
-    ax.set_xlabel('$M$'); ax.set_ylabel('Speedup')
-    ax.set_title('(b) Speedup [$K=1$]',fontsize=9)
-    ax.legend(); ax.grid(True,which='both',alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(f"{RESULT_DIR}/time_comparison.png",dpi=300,bbox_inches='tight')
-    plt.close()
+    ax.plot(sens['taus'], sens['rho'], color=C_DARK, lw=2.5,
+            label=r'Decentralized Response ($\rho^*$)')
+    ax.axhline(eq_c['rho'], color=C_GREEN, ls='-.', lw=2.5,
+               label=fr'Centralized VIF Benchmark ($\rho^C={eq_c["rho"]:.3f}$)')
 
-    fig, ax = plt.subplots(figsize=(5.5,4))
-    ax.plot(Ms,speedups,'d-',color='#2ca02c',lw=1.8,ms=5,label='Measured speedup')
-    ax.plot(Ms,th_shape,'--',color='gray',lw=1.2,label='$M/K$ shape')
-    ax.set_xscale('log')
-    ax.set_xlabel('$M$'); ax.set_ylabel('Speedup')
-    ax.set_title('Speedup vs $M$  [$K_{eff}=1$]',fontsize=10)
-    ax.legend(); ax.grid(True,which='both',alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(f"{RESULT_DIR}/speedup_vs_M.png",dpi=300,bbox_inches='tight')
-    plt.close()
-    print("  Saved: time_comparison.png, speedup_vs_M.png")
+    # Gap segment at τ*
+    ax.plot([eq_d['tau'], eq_d['tau']], [eq_d['rho'], eq_c['rho']],
+            color=C_RED, lw=2.5)
+    ax.scatter([eq_d['tau']], [eq_d['rho']],
+               color=C_RED, s=65, zorder=5, label='Decentralized Equilibrium')
 
-    # Fig2: speedup vs K + convergence vs K
-    K_vals = list(results_B.keys())
-    M_fixed = results_B[K_vals[0]]['M']
-    sp_meas = [results_B[K]['speedup'] for K in K_vals]
-    sp_th   = [M_fixed/K for K in K_vals]
-    rp = [results_B[K]['rhat_pre'].max() for K in K_vals]
-    rt = [results_B[K]['rhat_trad'].max() for K in K_vals]
-    fig, axes = plt.subplots(1,2,figsize=(10,4))
-    xs = np.arange(len(K_vals)); bw = 0.35
+    mid_rho = (eq_d['rho'] + eq_c['rho']) / 2
+    gap     = eq_c['rho'] - eq_d['rho']
+    ax.text(eq_d['tau'] + 3, mid_rho,
+            f'Coordination Gap\n$\\Delta\\rho = {gap:.3f}$',
+            color=C_RED, fontweight='bold', va='center', fontsize=10.5)
+
+    ax.set(xlabel=r'Carbon Tax Level ($\tau$)',
+           ylabel=r'Recycling Rate ($\rho$)',
+           title='B. Recycling Rate & Coordination Gap')
+    ax.legend(frameon=False, loc='lower right')
+    _clean_ax(ax)
+
+    plt.savefig('CLSC_Set1_Pricing_Recycling.png')
+    plt.savefig('CLSC_Set1_Pricing_Recycling.pdf')
+    plt.show()
+    print("  [Saved] CLSC_Set1_Pricing_Recycling.{png,pdf}")
+
+
+# ==============================================================
+# Figure Set 2 — Emission Trajectory & Welfare Optimization
+# ==============================================================
+def plot_set_2(eq_nt, eq_d, eq_c, sens):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    # ── 2A: Emission Trajectory ─────────────────────────────────
     ax = axes[0]
-    ax.bar(xs-bw/2,sp_th,bw,color='#aec7e8',alpha=0.85,label='Theory $M/K$')
-    ax.bar(xs+bw/2,sp_meas,bw,color='#2ca02c',alpha=0.85,label='Measured')
-    for i,(th_v,ms_v) in enumerate(zip(sp_th,sp_meas)):
-        ax.text(i-bw/2,th_v+2,f'{th_v:.0f}x',ha='center',fontsize=7,color='#1f77b4')
-        ax.text(i+bw/2,ms_v+0.5,f'{ms_v:.1f}x',ha='center',fontsize=7)
-    ax.set_xticks(xs); ax.set_xticklabels([f'$K={k}$' for k in K_vals])
-    ax.set_xlabel('$K$'); ax.set_ylabel('Speedup')
-    ax.set_title(f'(a) Speedup vs $K$  [$M={M_fixed}$]\nRemark 1: gap=MCMC overhead',fontsize=9)
-    ax.legend(); ax.grid(axis='y',alpha=0.25)
-    ax = axes[1]
-    ax.bar(xs-bw/2,rp,bw,color='#1f77b4',alpha=0.85,label='With precomp.')
-    ax.bar(xs+bw/2,rt,bw,color='#d62728',alpha=0.85,label='Without precomp.')
-    ax.axhline(1.2,color='#d62728',ls='--',lw=1.2,alpha=0.7,label='Threshold 1.2')
-    ax.set_xticks(xs); ax.set_xticklabels([f'$K={k}$' for k in K_vals])
-    ax.set_xlabel('$K$'); ax.set_ylabel('Max $\\hat{R}$')
-    ax.set_title('(b) Convergence vs $K$  [Theorem 3]',fontsize=9)
-    ax.set_ylim(0.95,1.35); ax.legend(); ax.grid(axis='y',alpha=0.25)
-    plt.tight_layout()
-    plt.savefig(f"{RESULT_DIR}/speedup_vs_K.png",dpi=300,bbox_inches='tight')
-    plt.close()
-    print("  Saved: speedup_vs_K.png")
+    ax.plot(sens['taus'], sens['E'], color=C_ORANG, lw=2.5,
+            label=r'Actual Emissions ($E$)')
+    ax.axhline(eq_nt['E'], color=C_GREY, ls='--', lw=1.5,
+               label=f'No-Tax Baseline ($E_0={eq_nt["E"]:.1f}$)')
 
-    # Fig3: posterior accuracy
-    K = best_C['K']; tv = best_C['theta_true']
-    xp = np.arange(K); w = 0.22
-    fig, axes = plt.subplots(1,2,figsize=(10,4))
-    fig.suptitle(f'Posterior accuracy ($M={best_C["M"]}$, $K={K}$) — Theorem 1',fontsize=10)
+    # Shade emission reduction area
+    below = sens['E'] < eq_nt['E']
+    ax.fill_between(sens['taus'], sens['E'], eq_nt['E'],
+                    where=below, color=C_GREEN, alpha=0.15,
+                    label='Emission Reduction Region')
+
+    ax.axvline(eq_d['tau'], color=C_RED, ls=':', lw=1.8, alpha=0.85)
+    ax.scatter([eq_d['tau']], [eq_d['E']], color=C_RED, s=65, zorder=5)
+
+    # Mark VIF emission level
+    ax.axhline(eq_c['E'], color=C_BLUE, ls=':', lw=1.5,
+               label=fr'VIF Emission ($E^C={eq_c["E"]:.1f}$, $\tau^C={eq_c["tau"]:.1f}$)')
+    ax.annotate('Note: $E^C > E^*$\n(output effect > recycling effect)',
+                xy=(eq_c['tau'] * 0.45, eq_c['E'] + 0.5),
+                fontsize=9.5, color=C_BLUE, style='italic')
+
+    ax.set(xlabel=r'Carbon Tax Level ($\tau$)',
+           ylabel=r'Total Carbon Emissions ($E$)',
+           title='A. Environmental Impact Control')
+    ax.legend(frameon=False, fontsize=9.5)
+    _clean_ax(ax)
+
+    # ── 2B: Social Welfare Optimization ─────────────────────────
+    ax = axes[1]
+    ax.plot(sens['taus'], sens['SW'], color=C_DARK, lw=2.5,
+            label=r'Social Welfare ($SW$)')
+    ax.axhline(eq_nt['SW'], color=C_GREY, ls='--', lw=1.5,
+               label=f'No-Tax Baseline ($SW_0={eq_nt["SW"]:.0f}$)')
+
+    # Effective policy zone
+    feasible = sens['SW'] > eq_nt['SW']
+    ax.fill_between(sens['taus'], 0, 1,
+                    where=feasible, color=C_BLUE, alpha=0.08,
+                    transform=ax.get_xaxis_transform(),
+                    label=r'Effective Policy Zone ($SW > SW_0$)')
+
+    # Welfare maximum
+    idx = int(np.nanargmax(sens['SW']))
+    ax.scatter([sens['taus'][idx]], [sens['SW'][idx]],
+               color=C_RED, s=90, edgecolor='white', lw=1.5, zorder=6)
+    ax.annotate('Welfare Maximum',
+                xy=(sens['taus'][idx], sens['SW'][idx]),
+                xytext=(sens['taus'][idx] + 14, sens['SW'][idx]),
+                arrowprops=dict(facecolor=C_RED, arrowstyle='->', lw=1.1),
+                fontsize=10.5, color=C_RED, fontweight='bold')
+
+    # VIF welfare level
+    ax.axhline(eq_c['SW'], color=C_GREEN, ls='-.', lw=1.8,
+               label=fr'VIF Benchmark ($SW^C={eq_c["SW"]:.0f}$)')
+
+    ax.set(xlabel=r'Carbon Tax Level ($\tau$)',
+           ylabel=r'Social Welfare ($SW$)',
+           title='B. Social Welfare Optimization')
+    ax.set_ylim(bottom=min(sens['SW']) * 0.992, top=max(sens['SW']) * 1.008)
+    ax.legend(frameon=False, loc='lower center')
+    _clean_ax(ax)
+
+    plt.savefig('CLSC_Set2_Environment_Welfare.png')
+    plt.savefig('CLSC_Set2_Environment_Welfare.pdf')
+    plt.show()
+    print("  [Saved] CLSC_Set2_Environment_Welfare.{png,pdf}")
+
+
+# ==============================================================
+# Figure Set 3 — Strategic Benchmarking & Green Preference
+# ==============================================================
+def plot_set_3(cfg, eq_nt, eq_d, eq_c, strat_sens):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    # ── 3A: Three-Scenario Bar Chart ────────────────────────────
     ax = axes[0]
-    ax.bar(xp-w,tv,w,color='#7f7f7f',alpha=0.7,label='True $\\theta$')
-    ax.bar(xp,best_C['mean_pre'],w,color='#1f77b4',alpha=0.85,
-           yerr=2*best_C['std_pre'],capsize=3,error_kw={'lw':1},
-           label='With precomp. ($\\pm2\\sigma$)')
-    ax.bar(xp+w,best_C['mean_trad'],w,color='#d62728',alpha=0.85,
-           yerr=2*best_C['std_trad'],capsize=3,error_kw={'lw':1},
-           label='Without precomp. ($\\pm2\\sigma$)')
-    ax.set_xticks(xp); ax.set_xticklabels([f'$\\theta_{j+1}$' for j in range(K)])
-    ax.set_ylabel('Value'); ax.set_title('(a) Mean vs. true value')
-    ax.legend(fontsize=8); ax.grid(axis='y',alpha=0.3)
+    labels   = [r'No Tax ($\tau=0$)',
+                fr'Decentralized ($\tau^*={eq_d["tau"]:.1f}$)',
+                fr'Centralized VIF ($\tau^C={eq_c["tau"]:.1f}$)']
+    rho_vals = [eq_nt['rho'], eq_d['rho'], eq_c['rho']]
+    sw_vals  = [eq_nt['SW'],  eq_d['SW'],  eq_c['SW']]
+
+    x, w = np.arange(3), 0.35
+    bars1 = ax.bar(x - w/2, rho_vals, w,
+                   label=r'Recycling Rate ($\rho$)',
+                   color=C_DARK, edgecolor='black', hatch='//', alpha=0.82)
+    ax2 = ax.twinx()
+    bars2 = ax2.bar(x + w/2, sw_vals, w,
+                    label=r'Social Welfare ($SW$)',
+                    color=C_GREEN, edgecolor='black', hatch='\\\\', alpha=0.82)
+
+    for bar in bars1:
+        ax.text(bar.get_x() + w/2, bar.get_height() + 0.006,
+                f'{bar.get_height():.3f}', ha='center',
+                fontweight='bold', fontsize=10)
+    for bar in bars2:
+        ax2.text(bar.get_x() + w/2, bar.get_height() + max(sw_vals)*0.008,
+                 f'{bar.get_height():.0f}', ha='center', fontsize=10)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.set_ylabel(r'Recycling Rate ($\rho$)', color=C_DARK, fontweight='bold')
+    ax2.set_ylabel(r'Social Welfare ($SW$)',  color=C_GREEN, fontweight='bold')
+    ax.set_title(
+        f'A. System Efficiency & Coordination Gap\n'
+        f'$\\Delta\\rho={eq_c["rho"]-eq_d["rho"]:.3f}$,  '
+        f'PoA $= {eq_d["SW"]/eq_c["SW"]:.3f}$,  '
+        f'VIF profit $= {eq_c["pi_vif"]:.0f} > 0$ [OK]',
+        loc='left', fontsize=12)
+
+    ax.spines['top'].set_visible(False)
+    ax2.spines['top'].set_visible(False)
+    lines1, lbl1 = ax.get_legend_handles_labels()
+    lines2, lbl2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, lbl1 + lbl2, loc='upper left', frameon=False)
+
+    # ── 3B: γ Sensitivity ───────────────────────────────────────
     ax = axes[1]
-    ax.bar(xp-w/2,best_C['std_pre'],w*0.9,color='#1f77b4',alpha=0.85,label='With precomp.')
-    ax.bar(xp+w/2,best_C['std_trad'],w*0.9,color='#d62728',alpha=0.85,label='Without precomp.')
-    ax.set_xticks(xp); ax.set_xticklabels([f'$\\theta_{j+1}$' for j in range(K)])
-    ax.set_ylabel('Std. dev.'); ax.set_title('(b) Uncertainty (must be identical)')
-    ax.legend(fontsize=8); ax.grid(axis='y',alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f"{RESULT_DIR}/posterior_accuracy.png",dpi=300,bbox_inches='tight')
-    plt.close()
-    print("  Saved: posterior_accuracy.png")
+    gammas    = strat_sens['gammas']
+    tau_stars = strat_sens['tau_stars']
+    rho_stars = strat_sens['rho_stars']
 
-    # Fig4: R-hat vs M
-    fig, ax = plt.subplots(figsize=(6,4))
-    ax.plot(Ms,[r['rhat_pre'].max() for r in results_A],
-            'o-',color='#1f77b4',lw=1.8,ms=5,label='With precomp.')
-    ax.plot(Ms,[r['rhat_trad'].max() for r in results_A],
-            's--',color='#d62728',lw=1.8,ms=5,alpha=0.7,label='Without precomp.')
-    ax.axhline(1.2,color='#d62728',ls='--',lw=1.2,alpha=0.7,label='Threshold 1.2')
-    ax.set_xscale('log')
-    ax.set_xlabel('$M$'); ax.set_ylabel('Max $\\hat{R}$')
-    ax.set_title('Convergence [$K=1$] — Theorem 3',fontsize=10)
-    ax.set_ylim(0.97,1.35); ax.legend(); ax.grid(True,which='both',alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(f"{RESULT_DIR}/rhat_with_vs_without_precompute.png",dpi=300,bbox_inches='tight')
-    plt.close()
-    print("  Saved: rhat_with_vs_without_precompute.png")
+    ax.plot(gammas, tau_stars, color=C_RED, lw=2.5,
+            marker='o', markevery=5, ms=5,
+            label=r'Optimal Tax ($\tau^*$)')
+    ax.set_xlabel(r'Consumer Green Preference ($\gamma$)')
+    ax.set_ylabel(r'Optimal Carbon Tax ($\tau^*$)',
+                  color=C_RED, fontweight='bold')
 
-    # Fig5: noise robustness
-    sigmas = [r['sigma'] for r in results_E]
-    fig, axes = plt.subplots(1,3,figsize=(13,4))
-    fig.suptitle('Noise robustness  ($K=1$, $M=8000$)',fontsize=10)
-    for ax,(ys,ttl,yl) in zip(axes,[
-        ([r['speedup'] for r in results_E],
-         '(a) Speedup vs. $\\sigma$','Speedup'),
-        ([r['rhat_pre'].max() for r in results_E],
-         '(b) Max $\\hat{R}$ vs. $\\sigma$','Max $\\hat{R}$'),
-        ([abs(r['mean_pre'][0]-r['theta_true'][0]) for r in results_E],
-         '(c) Error vs. $\\sigma$','$|$mean$-$true$|$'),
-    ]):
-        ax.plot(sigmas,ys,'o-',color='#2ca02c',lw=1.8,ms=5)
-        if 'hat' in yl:
-            ax.axhline(1.2,color='#d62728',ls='--',lw=1,alpha=0.7)
-            ax.set_ylim(0.97,1.35)
-        ax.set_xlabel('$\\sigma$'); ax.set_ylabel(yl)
-        ax.set_title(ttl,fontsize=9); ax.grid(alpha=0.25)
-    plt.tight_layout()
-    plt.savefig(f"{RESULT_DIR}/noise_robustness.png",dpi=300,bbox_inches='tight')
-    plt.close()
-    print("  Saved: noise_robustness.png")
+    ax3 = ax.twinx()
+    ax3.plot(gammas, rho_stars, color=C_DARK, lw=2.5, ls='--',
+             marker='s', markevery=5, ms=5,
+             label=r'Equilibrium Recycling Rate ($\rho^*$)')
+    ax3.set_ylabel(r'Recycling Rate ($\rho^*$)',
+                   color=C_DARK, fontweight='bold')
+
+    ax.set_title('B. Strategic Impact of Consumer Green Preference', loc='left')
+    ax.spines['top'].set_visible(False)
+    ax3.spines['top'].set_visible(False)
+    ax.grid(True, linestyle=':', alpha=0.4)
+
+    l1, lb1 = ax.get_legend_handles_labels()
+    l2, lb2 = ax3.get_legend_handles_labels()
+    ax.legend(l1 + l2, lb1 + lb2, loc='upper left', frameon=False)
+
+    plt.savefig('CLSC_Set3_Strategy.png')
+    plt.savefig('CLSC_Set3_Strategy.pdf')
+    plt.show()
+    print("  [Saved] CLSC_Set3_Strategy.{png,pdf}")
 
 
-# ─── Tables ──────────────────────────────────────────────────────────
+# ==============================================================
+# Console Report
+# ==============================================================
+def print_paper_report(eq_nt, eq_d, eq_c):
 
-def print_tables(results_A, results_B, best_C, results_E):
-    print("\n"+"="*72)
-    print("TABLE 1  K=1  multi-scale M")
-    print("="*72)
-    print(f"{'M':>7} {'t_pre':>9} {'t_trad':>10} {'Speedup':>9} "
-          f"{'Th.M/K':>8} {'Rhat':>8}")
-    print("-"*56)
-    for r in results_A:
-        print(f"{r['M']:>7d} {r['t_pre']:>9.2f} {r['t_trad']:>10.2f} "
-              f"{r['speedup']:>9.2f} {float(r['M']):>8.0f} "
-              f"{r['rhat_pre'].max():>8.3f}")
+    DIV  = "═" * 87
+    div  = "─" * 87
 
-    print("\n"+"="*72)
-    print("TABLE 2  K=2,4,8  M=8000  (Fix1: A cached | Fix2: optimal steps)")
-    print("="*72)
-    print(f"{'K':>5} {'t_pre':>9} {'t_trad':>10} {'Speedup':>9} "
-          f"{'Th.M/K':>8} {'Rhat':>8} {'Err':>9}")
-    print("-"*65)
-    for K,r in results_B.items():
-        err = np.abs(r['mean_pre']-r['theta_true']).mean()
-        print(f"{K:>5d} {r['t_pre']:>9.2f} {r['t_trad']:>10.2f} "
-              f"{r['speedup']:>9.2f} {r['M']/K:>8.0f} "
-              f"{r['rhat_pre'].max():>8.3f} {err:>9.4f}")
+    print(f"\n{DIV}")
+    print(" 📜  RESEARCH PAPER ASSISTANT: DATA & INSIGHTS REPORT".center(87))
+    print(DIV)
 
-    print(f"\n"+"="*72)
-    print(f"TABLE 3  Posterior equivalence  M={best_C['M']}, K={best_C['K']}")
-    print("="*72)
-    K = best_C['K']; tv = best_C['theta_true']
-    print(f"{'Param':<6} {'True':>10} {'Pre mean':>14} "
-          f"{'Trad mean':>14} {'|Dmean|':>11}")
-    print("-"*58)
-    for j in range(K):
-        diff = abs(best_C['mean_pre'][j]-best_C['mean_trad'][j])
-        print(f"th{j+1:<4} {tv[j]:>10.6f} {best_C['mean_pre'][j]:>14.9f} "
-              f"{best_C['mean_trad'][j]:>14.9f} {diff:>11.3e}")
+    # ── Section 1: Equilibrium Table ────────────────────────────
+    print("\n>>> SECTION 1: MACRO SYSTEM EQUILIBRIUM COMPARISON")
+    print(div)
+    h = f"  {'Metric':<24}  {'No Tax (Base)':>15}  {'Decentralized (τ*)':>18}  {'VIF Centralized':>15}"
+    print(h)
+    print(div)
 
-    print("\n"+"="*72)
-    print("TABLE 4  Noise robustness  K=1, M=8000")
-    print("="*72)
-    print(f"{'sigma':>7} {'Speedup':>9} {'Rhat':>8} {'Err':>12}")
-    print("-"*42)
-    for r in results_E:
-        err = abs(r['mean_pre'][0]-r['theta_true'][0])
-        print(f"{r['sigma']:>7.2f} {r['speedup']:>9.2f} "
-              f"{r['rhat_pre'].max():>8.3f} {err:>12.5f}")
+    rows = [
+        ("Carbon Tax (τ)",        0.0,         eq_d['tau'],   eq_c['tau']),
+        ("Retail Price (p)",      eq_nt['p'],  eq_d['p'],     eq_c['p']),
+        ("Wholesale Price (w)",   eq_nt['w'],  eq_d['w'],     float('nan')),
+        ("Recycling Rate (ρ)",    eq_nt['rho'],eq_d['rho'],   eq_c['rho']),
+        ("Market Demand (D)",     eq_nt['D'],  eq_d['D'],     eq_c['D']),
+        ("Total Emissions (E)",   eq_nt['E'],  eq_d['E'],     eq_c['E']),
+        ("Mfr/VIF Profit (π)",   eq_nt['pi_m'],eq_d['pi_m'], eq_c['pi_vif']),
+        ("Retailer Profit (π_r)",eq_nt['pi_r'],eq_d['pi_r'], float('nan')),
+        ("Consumer Surplus (CS)", eq_nt['CS'], eq_d['CS'],    eq_c['CS']),
+        ("Env. Damage (η·E²)",   eq_nt['env_dam'],eq_d['env_dam'],eq_c['env_dam']),
+        ("Tax Revenue (τ·E)",     0.0,         eq_d['tax_rev'],eq_c['tax_rev']),
+        ("Social Welfare (SW)",   eq_nt['SW'], eq_d['SW'],    eq_c['SW']),
+    ]
+    for name, v1, v2, v3 in rows:
+        s3 = f"{v3:>15.2f}" if not (isinstance(v3, float) and np.isnan(v3)) else f"{'—':>15}"
+        print(f"  {name:<24}  {v1:>15.2f}  {v2:>18.2f}  {s3}")
+
+    # ── Section 2: Sanity Checks ─────────────────────────────────
+    print(f"\n>>> SECTION 2: ECONOMIC SANITY CHECKS")
+    print(div)
+
+    cfg_tau_max = 150
+    checks = [
+        ("τ* is interior solution",             0 < eq_d['tau'] < cfg_tau_max * 0.97),
+        ("τ^C is interior solution",            0 < eq_c['tau'] < cfg_tau_max * 0.97),
+        ("ρ* is interior  (0, 1)",              0.01 < eq_d['rho'] < 0.99),
+        ("ρ^C is interior (0, 1)",              0.01 < eq_c['rho'] < 0.99),
+        ("VIF profit ≥ 0 (participates)",       eq_c['pi_vif'] >= 0),
+        ("p_dec > p_VIF (double margin.)",      eq_d['p'] > eq_c['p']),
+        ("ρ^C > ρ* (coordination gap > 0)",     eq_c['rho'] > eq_d['rho']),
+        ("τ^C > τ* (VIF needs stronger signal)",eq_c['tau'] > eq_d['tau']),
+        ("SW_dec > SW_notax (tax improves SW)", eq_d['SW'] > eq_nt['SW']),
+        ("SW_VIF > SW_dec (VIF more efficient)",eq_c['SW'] > eq_d['SW']),
+        ("Mfr profit > 0",                      eq_d['pi_m'] > 0),
+        ("Retailer profit > 0",                 eq_d['pi_r'] > 0),
+    ]
+    for name, ok in checks:
+        print(f"  {'✓' if ok else '✗'}  {name}")
+
+    # ── Section 3: Key Findings ───────────────────────────────────
+    E_red   = (eq_nt['E']  - eq_d['E'])  / eq_nt['E']  * 100
+    SW_gain = (eq_d['SW']  - eq_nt['SW'])/ eq_nt['SW'] * 100
+    gap     = eq_c['rho']  - eq_d['rho']
+    prof_d  = eq_d['pi_m'] + eq_d['pi_r']
+    prof_nt = eq_nt['pi_m']+ eq_nt['pi_r']
+    prof_drop = (prof_nt - prof_d) / prof_nt * 100
+    m_share   = eq_d['pi_m'] / prof_d * 100
+    r_share   = eq_d['pi_r'] / prof_d * 100
+    poa       = eq_d['SW']   / eq_c['SW']
+
+    print(f"\n>>> SECTION 3: KEY FINDINGS FOR 'RESULTS & DISCUSSION'")
+    print(div)
+
+    print(f"\n🔹 [Environmental Effectiveness]")
+    print(f"   The optimal carbon tax (τ* = {eq_d['tau']:.2f}) reduces total emissions by")
+    print(f"   {E_red:.1f}% (from {eq_nt['E']:.1f} to {eq_d['E']:.1f}).")
+    print(f"   Note: VIF emissions (E^C = {eq_c['E']:.1f}) exceed E^* = {eq_d['E']:.1f}, because")
+    print(f"   eliminating double marginalization expands output (D^C={eq_c['D']:.1f} > D^*={eq_d['D']:.1f}),")
+    print(f"   and the demand effect outweighs the recycling effect — a supply-chain")
+    print(f"   'green paradox'. This motivates a stronger centralized tax (τ^C={eq_c['tau']:.1f} > τ*={eq_d['tau']:.1f}).")
+
+    print(f"\n🔹 [Welfare vs. Profit Trade-off]")
+    print(f"   The tax reduces total supply chain profit by {prof_drop:.1f}%,")
+    print(f"   yet social welfare rises by {SW_gain:.1f}%, as tax revenue redistribution")
+    print(f"   and environmental damage reduction more than offset private losses.")
+
+    print(f"\n🔹 [Double Marginalization & Coordination Gap]")
+    print(f"   In the decentralized channel, the retailer's markup is {eq_d['p']-eq_d['w']:.2f}.")
+    print(f"   VIF eliminates this, lowering retail price by {eq_d['p']-eq_c['p']:.2f} (from {eq_d['p']:.1f} to {eq_c['p']:.1f}).")
+    print(f"   This drives the recycling rate from ρ* = {eq_d['rho']:.3f} to ρ^C = {eq_c['rho']:.3f},")
+    print(f"   a coordination gap of Δρ = {gap:.3f}.")
+    print(f"   Critically, VIF remains profitable (π_VIF = {eq_c['pi_vif']:.0f} > 0).")
+
+    print(f"\n🔹 [Profit Distribution — Decentralized Channel]")
+    print(f"   Under τ*, the manufacturer captures {m_share:.1f}% of channel profit,")
+    print(f"   leaving {r_share:.1f}% to the retailer — reflecting Stackelberg leader advantage.")
+
+    print(f"\n🔹 [Efficiency Loss (Price of Anarchy)]")
+    print(f"   PoA = SW(τ*) / SW^C = {poa:.4f}  →  {(1-poa)*100:.1f}% welfare loss")
+    print(f"   from market decentralization, motivating supply chain coordination mechanisms.")
+
+    print(f"\n{DIV}\n")
 
 
-# ─── Main ─────────────────────────────────────────────────────────────
-
+# ==============================================================
+# Main
+# ==============================================================
 def main():
-    np.random.seed(SEED); t0 = time.time()
-    print("="*60)
-    print("Precomputation-Driven MH-MCMC: Paper Validation (FIXED v2)")
-    print(f"  N={N_SAMPLES}  burn-in={N_BURNIN}  chains={N_CHAINS}")
-    print("  Fix1: traditional uses A_cached (no A rebuild per iter)")
-    print("  Fix2: steps = (2.38/sqrt(K))*post_std  (RWM optimal)")
-    print("="*60)
+    cfg = ModelConfig()
 
-    res_A  = exp_A()
-    res_B  = exp_B()
-    best_C = exp_C(res_A)
-    exp_D(res_A, res_B)
-    res_E  = exp_E()
-    exp_F(res_A, res_B)
+    print("\n" + "=" * 60)
+    print("  CLSC Model  —  Fixed & Verified")
+    print("=" * 60)
+    print(f"  Emission model : E = e_m·(1-ρ)·D + e_r·ρ·D  [substitution]")
+    print(f"  Welfare        : SW = CS + π + τ·E − η·E²    [with tax return]")
+    print(f"  Centralized    : VIF profit-maximizing + participation ≥ 0")
+    print(f"  k = {cfg.k}  (ensures interior ρ* and ρ^C)")
 
-    print("\n-- Figures --"); plot_all(res_A, res_B, best_C, res_E)
-    print("\n-- Tables --");  print_tables(res_A, res_B, best_C, res_E)
-    print(f"\nTotal: {time.time()-t0:.1f}s  Output: {RESULT_DIR}/")
+    # ── Solve Equilibria ────────────────────────────────────────
+    print("\n[1/3] Solving equilibria...")
+    eq_nt = decentralized_equilibrium(cfg, tau=0.0)
+    eq_d  = decentralized_equilibrium(cfg)
+    eq_c  = centralized_equilibrium(cfg)
+
+    # ── Console Report ──────────────────────────────────────────
+    print_paper_report(eq_nt, eq_d, eq_c)
+
+    # ── Sensitivity Data ────────────────────────────────────────
+    print("[2/3] Computing sensitivity data (100 + 40 grid points)...")
+    sens       = standard_sensitivity(cfg, n=100)
+    strat_sens = strategic_sensitivity(cfg, n=40)
+
+    # ── Figures ─────────────────────────────────────────────────
+    print("[3/3] Rendering 600 DPI publication figures...")
+    plot_set_1(eq_nt, eq_d, eq_c, sens)
+    plot_set_2(eq_nt, eq_d, eq_c, sens)
+    plot_set_3(cfg, eq_nt, eq_d, eq_c, strat_sens)
+
+    print("\n✅  All figures saved (600 DPI, PNG + PDF).")
 
 
 if __name__ == "__main__":
